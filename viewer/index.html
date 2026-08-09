@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vistarama</title>
+  <link rel="stylesheet" href="vendor/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="map"></div>
+
+  <aside id="panel">
+    <header>
+      <h1 id="aoi-name">loading…</h1>
+      <p id="aoi-sub"></p>
+    </header>
+
+    <section>
+      <h2>Rasters</h2>
+      <div id="raster-list" class="layer-list"></div>
+    </section>
+
+    <section>
+      <h2>Vectors</h2>
+      <div id="vector-list" class="layer-list"></div>
+    </section>
+
+    <section>
+      <h2>Extents</h2>
+      <div id="extent-list" class="layer-list"></div>
+    </section>
+
+    <section>
+      <h2>View from here</h2>
+      <button id="pick-view" class="tool-btn">Pick a viewpoint</button>
+      <p class="tool-hint">Renders the 360° panorama from 2 m above the chosen
+        point, with curvature and haze.</p>
+    </section>
+
+    <section id="legend-section" hidden>
+      <h2>Legend</h2>
+      <div id="legend"></div>
+    </section>
+  </aside>
+
+  <button id="panel-toggle" title="Show/hide panel">☰</button>
+
+  <aside id="inspect">
+    <h2>At cursor <span id="inspect-pos"></span></h2>
+    <div id="inspect-view"></div>
+    <div id="inspect-raster"></div>
+    <div id="inspect-vector"></div>
+    <p id="inspect-hint">move the cursor over the map</p>
+  </aside>
+
+  <div id="status">
+    <span id="pos">—</span>
+    <span id="zoom">—</span>
+    <span id="tier">—</span>
+  </div>
+
+  <section id="pano" hidden>
+    <div id="pano-resize" title="Drag to resize · double-click to reset"></div>
+    <header>
+      <h2 id="pano-title">View from here</h2>
+      <span id="pano-meta"></span>
+      <span class="spacer"></span>
+      <div id="pano-surface" class="pano-seg" role="group" aria-label="Surface">
+        <button id="pano-surface-sat" class="on" data-surface="sat">satellite</button>
+        <button id="pano-surface-lc" data-surface="lc">land cover</button>
+      </div>
+      <label class="pano-ctl">eye
+        <input id="pano-height" type="range" min="0" max="100" step="1" value="0">
+        <span id="pano-height-val">2 m</span>
+      </label>
+      <label class="pano-ctl">haze
+        <input id="pano-haze" type="range" min="0" max="100" step="1" value="80">
+        <span id="pano-haze-val">—</span>
+      </label>
+      <label class="pano-ctl">range
+        <input id="pano-range" type="range" min="0" max="100" step="1" value="63">
+        <span id="pano-range-val">120 km</span>
+      </label>
+      <button id="pano-snapmax" class="pano-btn" disabled>
+        Snap up<span id="pano-snapmax-d">—</span>
+      </button>
+      <button id="pano-reset" class="pano-btn" title="Reset the view">reset</button>
+      <button id="pano-close" title="Close">✕</button>
+    </header>
+    <div id="pano-stage">
+      <canvas id="pano-canvas"></canvas>
+      <div id="pano-horizon" hidden><span>0°</span></div>
+      <div id="pano-labels"></div>
+      <div id="pano-cursor" hidden></div>
+      <div id="pano-ticks"></div>
+      <div id="pano-hover" hidden></div>
+      <div id="pano-compass"></div>
+      <div id="pano-offset" hidden></div>
+      <div id="pano-hint">drag to look around · scroll to zoom · arrows / WASD to move</div>
+      <div id="pano-loading" hidden>
+        <div class="spin"></div>
+        <div id="pano-loading-text">building terrain…</div>
+        <div id="pano-loading-sub"></div>
+      </div>
+    </div>
+    <div id="pano-status">click a point on the map</div>
+  </section>
+
+  <script src="vendor/leaflet.js"></script>
+  <script src="pano3d.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

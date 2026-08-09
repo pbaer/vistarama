@@ -1,0 +1,641 @@
+:root {
+  --bg: #14171a;
+  --panel: #1d2126;
+  --panel-2: #262b31;
+  --line: #333a42;
+  --text: #dfe4ea;
+  --muted: #8d97a3;
+  --accent: #6fb2ff;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  font: 13px/1.45 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* Layout is driven by two custom properties kept in sync from JS
+   (syncLayoutVars): the panel's width and the panorama's total height. Both
+   are 0 when the thing is hidden, so the same rules cover every combination
+   without a class per state. */
+:root { --panel-w: 288px; --pano-h: 0px; }
+
+#map {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  bottom: var(--pano-h);          /* stop above the panorama, not under it */
+  background: #0d1013;
+}
+
+/* ---- panel ---- */
+#panel {
+  position: absolute;
+  top: 0; left: 0; bottom: 0;
+  width: 288px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+  z-index: 1000;
+  padding-bottom: 2rem;
+}
+#panel.hidden { display: none; }
+
+#panel header {
+  padding: 14px 14px 10px;
+  border-bottom: 1px solid var(--line);
+}
+#panel h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: .01em;
+}
+#panel header p {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+#panel section { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+#panel h2 {
+  margin: 0 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .09em;
+  color: var(--muted);
+}
+
+.layer {
+  margin-bottom: 7px;
+  padding: 5px 6px;
+  border-radius: 5px;
+  background: var(--panel-2);
+}
+.layer.off { background: transparent; }
+
+.layer-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  user-select: none;
+}
+.layer-head input { margin: 0; accent-color: var(--accent); cursor: pointer; }
+.layer-head .name { flex: 1; font-size: 12px; }
+.layer-head .swatch {
+  width: 11px; height: 11px;
+  border-radius: 2px;
+  border: 1px solid rgba(255,255,255,.25);
+  flex: none;
+}
+.layer-head .count {
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.layer-desc {
+  margin: 3px 0 0 22px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.opacity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 5px 0 1px 22px;
+}
+.opacity input { flex: 1; accent-color: var(--accent); height: 3px; }
+.opacity span {
+  font-size: 10px;
+  color: var(--muted);
+  width: 26px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.layer.off .opacity, .layer.off .layer-desc { display: none; }
+
+/* ---- legend ---- */
+.legend-group { margin-bottom: 10px; }
+.legend-group h3 {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.legend-item i {
+  width: 13px; height: 11px;
+  border-radius: 2px;
+  flex: none;
+  border: 1px solid rgba(255,255,255,.18);
+}
+.legend-bar {
+  height: 11px;
+  border-radius: 2px;
+  margin-bottom: 3px;
+  border: 1px solid rgba(255,255,255,.18);
+}
+.legend-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.legend-note {
+  margin-top: 3px;
+  font-size: 10px;
+  line-height: 1.35;
+  color: #79838f;
+}
+
+/* ---- inspector card ---- */
+#inspect {
+  position: absolute;
+  top: 10px; right: 10px;
+  z-index: 1000;
+  width: 262px;
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+  background: rgba(29,33,38,.96);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 9px 11px 10px;
+  backdrop-filter: blur(3px);
+}
+#inspect h2 {
+  margin: 0 0 7px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .09em;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+#inspect-pos {
+  text-transform: none;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+}
+#inspect-hint { margin: 0; font-size: 11px; color: var(--muted); }
+
+.ins-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  padding: 1.5px 0;
+}
+.ins-row .k { color: var(--muted); }
+.ins-row .v { font-variant-numeric: tabular-nums; text-align: right; }
+.ins-row .v.null { color: #5c6672; }
+
+.ins-sep {
+  margin: 8px 0 5px;
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .09em;
+  color: var(--muted);
+}
+.ins-feature {
+  margin-bottom: 5px;
+  padding-left: 7px;
+  border-left: 2px solid var(--line);
+}
+.ins-feature .ft {
+  font-size: 11.5px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.ins-feature .ft i {
+  width: 8px; height: 8px; border-radius: 2px; flex: none;
+}
+.ins-feature .fsub {
+  font-size: 10.5px;
+  color: var(--muted);
+  margin-left: 13px;
+  word-break: break-word;
+}
+
+/* ---- viewpoint tool ---- */
+.tool-btn {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.tool-btn:hover { border-color: var(--accent); }
+.tool-btn.armed {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0d1013;
+  font-weight: 600;
+}
+.tool-hint { margin: 6px 0 0; font-size: 10.5px; color: var(--muted); }
+.leaflet-container.picking, .leaflet-container.picking .leaflet-interactive {
+  cursor: crosshair !important;
+}
+
+/* ---- panorama pane ---- */
+#pano {
+  position: absolute;
+  left: var(--panel-w); right: 0; bottom: 0;
+  z-index: 1200;
+  background: #10141a;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+}
+#pano[hidden] { display: none; }
+
+#pano header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+}
+#pano h2 { margin: 0; font-size: 12px; font-weight: 600; }
+#pano header .spacer { flex: 1; }
+#pano-meta { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pano-ctl {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--muted);
+}
+.pano-ctl input { width: 92px; accent-color: var(--accent); }
+.pano-ctl span { width: 48px; font-variant-numeric: tabular-nums; }
+#pano-close, .pano-btn {
+  border: 1px solid var(--line); border-radius: 4px;
+  background: var(--panel-2); color: var(--text);
+  height: 22px; line-height: 1; cursor: pointer; font-size: 11px;
+}
+#pano-close { width: 22px; }
+.pano-btn { padding: 0 8px; }
+.pano-btn:hover { border-color: var(--accent); }
+
+/* Surface picker: a two-state segmented control rather than a checkbox, so
+   both options are named. "Satellite" vs "land cover" is a choice between two
+   things, not a feature being switched on. */
+.pano-seg {
+  display: inline-flex;
+  border: 1px solid var(--line); border-radius: 4px; overflow: hidden;
+  height: 22px;
+}
+.pano-seg button {
+  border: 0; background: var(--panel-2); color: var(--muted);
+  padding: 0 8px; height: 100%; line-height: 1;
+  font-size: 11px; cursor: pointer;
+}
+.pano-seg button + button { border-left: 1px solid var(--line); }
+.pano-seg button:hover:not(.on) { color: var(--text); }
+.pano-seg button.on {
+  background: var(--accent); color: #0b0f16; font-weight: 600;
+}
+.pano-seg button:disabled { opacity: .42; cursor: default; }
+.pano-btn:disabled {
+  opacity: .42;
+  cursor: default;
+  border-color: var(--line);
+}
+
+/* The snap button's text changes whenever the viewpoint moves. Give the
+   distance its own fixed-width slot so the toolbar never reflows. */
+#pano-snapmax {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  white-space: nowrap;
+}
+#pano-snapmax-d {
+  display: inline-block;
+  min-width: 42px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+#pano-snapmax:disabled #pano-snapmax-d { color: var(--muted); }
+
+/* Resize grip on the pane's top edge. The pane is anchored to the bottom, so
+   a CSS `resize: vertical` handle would sit at the bottom-right and grow the
+   pane downward off-screen — the edge that actually moves is the top one. */
+#pano-resize {
+  height: 7px;
+  margin-bottom: -1px;          /* sit on the border, not above it */
+  cursor: ns-resize;
+  touch-action: none;
+  background: transparent;
+  position: relative;
+  z-index: 2;
+}
+#pano-resize::after {
+  content: '';
+  position: absolute;
+  left: 50%; top: 2px;
+  width: 46px; height: 3px;
+  transform: translateX(-50%);
+  border-radius: 2px;
+  background: rgba(255,255,255,.18);
+}
+#pano-resize:hover::after, #pano-resize.dragging::after {
+  background: var(--accent);
+}
+body.pano-resizing { cursor: ns-resize; user-select: none; }
+
+#pano-stage { position: relative; height: 320px; overflow: hidden; }
+#pano-canvas { display: block; width: 100%; height: 100%; }
+
+/* true horizontal (elevation angle 0). The *visible* horizon sits below this
+   by the curvature drop, so the gap between them is meaningful. */
+/* The true horizontal. It has to read against both bright sky and dark
+   terrain, so the dashes are near-white and carry their own dark outline —
+   drop-shadow follows the dashes, where box-shadow would outline the
+   full-width box and draw a solid line through the gaps. */
+#pano-horizon {
+  position: absolute; left: 0; right: 0;
+  border-top: 1.5px dashed rgba(255,255,255,.85);
+  filter: drop-shadow(0 0 1.5px rgba(0,0,0,.95));
+  pointer-events: none;
+}
+#pano-horizon span {
+  position: absolute; right: 4px; top: -13px;
+  font-size: 9.5px; color: rgba(255,255,255,.85);
+  text-shadow: 0 1px 2px rgba(0,0,0,.95);
+}
+
+/* Summit markers. Same triangle as the map's peaks layer, at the same three
+   sizes and colours, so the panorama and the map share one visual legend.
+   Drawn with borders rather than SVG: a wide view can place 400+ of these and
+   a border triangle is one element with no child nodes. drop-shadow stands in
+   for the map marker's dark stroke — it follows the triangle, unlike
+   box-shadow, which would outline the (empty) border box instead. */
+#pano-ticks { position: absolute; inset: 0; pointer-events: none; }
+.pk-mark {
+  position: absolute;
+  width: 0; height: 0;
+  border-style: solid;
+  border-top-width: 0;
+  border-left-color: transparent;
+  border-right-color: transparent;
+  filter: drop-shadow(0 0 1.1px rgba(0,0,0,.95))
+          drop-shadow(0 0 2.4px rgba(0,0,0,.5));
+}
+/* radius 6 / 5 / 3.6 on the map; apex at -1.3r, base +0.8r and +/-1.15r */
+.pk-mark.volcano {
+  border-width: 0 6.9px 12.6px 6.9px;
+  border-bottom-color: #ff7043;
+  margin: -6.3px 0 0 -6.9px;
+}
+.pk-mark.high {
+  border-width: 0 5.8px 10.5px 5.8px;
+  border-bottom-color: #ffe08a;
+  margin: -5.25px 0 0 -5.8px;
+}
+.pk-mark.minor {
+  border-width: 0 4.1px 7.6px 4.1px;
+  border-bottom-color: #ffd166;
+  margin: -3.8px 0 0 -4.1px;
+}
+#pano-hover {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  margin-top: -8px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(14,18,25,.95);
+  border: 1px solid var(--line);
+  font-size: 11.5px;
+  line-height: 1.25;
+  color: #fff;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 5;
+}
+#pano-hover b { font-weight: 600; }
+#pano-hover i {
+  font-style: normal; font-size: 10.5px; color: #cfe0f0;
+  font-variant-numeric: tabular-nums;
+}
+
+#pano-loading {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 9px;
+  background: #10141a;
+  z-index: 8;
+}
+#pano-loading[hidden] { display: none; }
+#pano-loading .spin {
+  width: 22px; height: 22px;
+  border: 2px solid rgba(255,255,255,.16);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: pano-spin .8s linear infinite;
+}
+@keyframes pano-spin { to { transform: rotate(360deg); } }
+#pano-loading-text { font-size: 12px; color: var(--text); }
+#pano-loading-sub {
+  font-size: 10.5px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+#pano-offset {
+  position: absolute; left: 8px; bottom: 6px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(10,14,20,.78);
+  border: 1px solid var(--line);
+  font-size: 10.5px;
+  color: #cfe0f0;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  z-index: 6;
+}
+#pano-offset[hidden] { display: none; }
+#pano-offset.warn {
+  background: rgba(74,38,12,.9);
+  border-color: #d98a3a;
+  color: #ffd9a8;
+}
+
+#pano-hint {
+  position: absolute; right: 8px; bottom: 6px;
+  font-size: 10px; color: rgba(255,255,255,.6);
+  text-shadow: 0 1px 2px rgba(0,0,0,.8);
+  pointer-events: none;
+}
+
+#pano-labels { position: absolute; inset: 0; pointer-events: none; }
+
+/* Mirror of the map cursor. Same red as the map-side dot so the two read as
+   one object seen two ways. Dimmed when the point is behind terrain. */
+#pano-cursor {
+  position: absolute;
+  width: 11px; height: 11px;
+  margin: -6px 0 0 -6px;
+  border-radius: 50%;
+  background: #ff3b30;
+  border: 2px solid #fff;
+  box-shadow: 0 0 4px rgba(0,0,0,.8);
+  pointer-events: none;
+  z-index: 6;
+}
+#pano-cursor[hidden] { display: none; }
+/* Behind terrain: much fainter and desaturated, so "visible from here" and
+   "hidden behind that ridge" are obvious at a glance rather than a subtle
+   opacity difference. */
+#pano-cursor.occluded {
+  opacity: .3;
+  filter: saturate(.35);
+  border-color: rgba(255,255,255,.5);
+}
+/* Labels sit over hazy distant terrain, so a plain text shadow is not enough
+   contrast for the small detail text — they get a dark pill instead. */
+.pk {
+  position: absolute;
+  transform: translateX(-50%);
+  font-size: 11.5px;
+  line-height: 1.25;
+  color: #fff;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(10,14,20,.62);
+  text-shadow: 0 1px 2px rgba(0,0,0,.9);
+}
+.pk b { font-weight: 600; letter-spacing: .01em; }
+.pk i {
+  font-style: normal;
+  font-size: 10.5px;
+  color: #cfe0f0;
+  font-variant-numeric: tabular-nums;
+}
+.pk::after {
+  content: '';
+  position: absolute;
+  left: 50%; top: 100%;
+  width: 1px; height: var(--stem, 9px);
+  background: rgba(255,255,255,.65);
+}
+
+#pano-compass {
+  position: absolute; left: 0; right: 0; top: 0; height: 16px;
+  pointer-events: none;
+  background: linear-gradient(rgba(10,14,20,.55), rgba(10,14,20,0));
+}
+.cmp {
+  position: absolute; top: 0;
+  transform: translateX(-50%);
+  font-size: 9.5px; color: #e8eef5;
+  text-shadow: 0 1px 2px rgba(0,0,0,.9);
+  padding-top: 1px;
+}
+.cmp::after {
+  content: ''; position: absolute; left: 50%; top: 100%;
+  width: 1px; height: 5px; background: rgba(255,255,255,.45);
+}
+.cmp.card { font-weight: 700; font-size: 10.5px; }
+
+#pano-status {
+  padding: 3px 10px;
+  font-size: 10.5px;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+}
+
+/* ---- chrome ---- */
+#panel-toggle {
+  position: absolute;
+  top: 10px; left: 298px;
+  z-index: 1001;
+  width: 30px; height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+#panel.hidden + #panel-toggle { left: 10px; }
+
+#status {
+  position: absolute;
+  bottom: var(--pano-h); right: 0;
+  z-index: 1000;
+  display: flex;
+  gap: 14px;
+  padding: 4px 10px;
+  background: rgba(20,23,26,.9);
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+  border-radius: 5px 0 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.leaflet-container { background: #0d1013; }
+
+/* Leaflet adds .leaflet-interactive to the canvas while a feature is hovered.
+   Beat the container's `cursor: grab` so the cursor becomes a pointing hand
+   over anything clickable. */
+.leaflet-container.leaflet-grab .leaflet-interactive,
+.leaflet-container canvas.leaflet-interactive { cursor: pointer; }
+
+.leaflet-tooltip {
+  background: rgba(29,33,38,.96);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11.5px;
+  padding: 2px 6px;
+  box-shadow: none;
+}
+.leaflet-tooltip-top:before { border-top-color: var(--line); }
+.leaflet-popup-content-wrapper, .leaflet-popup-tip {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+.leaflet-popup-content { margin: 9px 11px; font-size: 11.5px; max-height: 300px; overflow: auto; }
+.leaflet-popup-content table { border-collapse: collapse; }
+.leaflet-popup-content td { padding: 1px 7px 1px 0; vertical-align: top; }
+.leaflet-popup-content td:first-child { color: var(--muted); white-space: nowrap; }
+.leaflet-popup-content h4 { margin: 0 0 5px; font-size: 12px; }
+.leaflet-bar a { background: var(--panel); color: var(--text); border-color: var(--line); }
+.leaflet-bar a:hover { background: var(--panel-2); color: var(--text); }
+.leaflet-control-attribution {
+  background: rgba(20,23,26,.85) !important;
+  color: var(--muted) !important;
+  font-size: 10px;
+}
+.leaflet-control-attribution a { color: var(--accent) !important; }
+.leaflet-control-scale-line {
+  background: rgba(20,23,26,.8);
+  border-color: var(--line);
+  color: var(--text);
+}

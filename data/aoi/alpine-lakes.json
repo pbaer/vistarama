@@ -1,0 +1,45 @@
+{
+  "slug": "alpine-lakes",
+  "name": "Alpine Lakes Wilderness, Central WA Cascades",
+  "notes": "Core covers the Alpine Lakes Wilderness and immediate surroundings. The buffered box adds 60 km on every side so the view march has far-field terrain in all directions; it reaches Mt Rainier (SW), Glacier Peak (N) and the Columbia basin (E).",
+
+  "core": { "west": -121.60, "south": 47.25, "east": -120.60, "north": 47.85 },
+  "buffer_km": 60,
+  "buffered": { "west": -122.40, "south": 46.71, "east": -119.80, "north": 48.39 },
+
+  "_vector_note": "Candidate points only need the core; the 60 km buffer exists so the view march has far-field terrain. Pulling OSM over the full buffer drags in the whole Seattle metro (380k road ways), which is irrelevant here. This intermediate box covers the range and its approach towns - North Bend, Snoqualmie Pass, Stevens Pass, Leavenworth, Cle Elum - and stops short of Puget Sound.",
+  "vector": { "west": -122.05, "south": 46.95, "east": -120.15, "north": 48.15 },
+
+  "metric_crs": "EPSG:5070",
+  "display_crs": "EPSG:3857",
+  "dem_resolution_m": 30,
+  "landcover_resolution_m": 10,
+
+  "vector_extent": "vector",
+
+  "sources": {
+    "dem": {
+      "dataset": "USGS 3DEP 1 arc-second",
+      "license": "Public domain (US Government work)",
+      "tiles": [
+        "n47w120", "n47w121", "n47w122", "n47w123",
+        "n48w120", "n48w121", "n48w122", "n48w123",
+        "n49w120", "n49w121", "n49w122", "n49w123"
+      ]
+    },
+    "landcover": {
+      "dataset": "ESA WorldCover 10 m 2021 v200",
+      "license": "CC BY 4.0",
+      "tiles": ["N45W123", "N45W120", "N48W123", "N48W120"]
+    },
+    "glaciers": {
+      "dataset": "RGI 7.0 region 02 (Western Canada and USA)",
+      "license": "CC BY 4.0",
+      "fallback": "OSM natural=glacier"
+    },
+    "vectors": {
+      "dataset": "OpenStreetMap via Overpass API",
+      "license": "ODbL 1.0"
+    }
+  }
+}
