@@ -405,9 +405,10 @@ back to the next, so the same code works in Washington and in the Alps.
 ### NAIP — the United States only, sixteen times sharper
 
 - **0.6 m native**, public domain (USDA). Flown state by state on a multi-year
-  cycle. Downloaded here at **2 m**, which is the useful ceiling: it is well
-  past what a 30 m DEM can shape, and it is the panorama's near-field texture
-  that consumes it.
+  cycle. Downloaded here at **2 m**: well past what a 30 m DEM can shape, and
+  enough for the panorama at normal zoom. At the tightest zoom (fov 8°) the
+  screen resolves ~1.4 m on terrain 9 km away, so 2 m is no longer quite the
+  ceiling there; the panorama's focus patches already sample it natively.
 - **Access:** Planetary Computer STAC,
   `https://planetarycomputer.microsoft.com/api/stac/v1/search`, collection
   `naip`, assets signed with a free account-less SAS token from
@@ -418,8 +419,8 @@ back to the next, so the same code works in Washington and in the Alps.
 - **Quad selection:** summer acquisitions beat recency. A late-October quad
   carries fresh snow that an August quad two years older does not.
 - **Cost:** ~187 quads for the core AOI, ~35 minutes at 12 concurrent
-  connections. Native resolution over this AOI would be ~40 GB; at 2 m through
-  the COG overviews it is a small fraction of that.
+  connections, 7.7 GB at 2 m including overviews. Native 0.6 m over the same
+  90 × 84 km would be ~63 GB of uncompressed RGB before overviews.
 
 ### Ruled out
 

@@ -131,6 +131,10 @@ burden.
 
 ## What we should add
 
+Status: **openness is in** (`openness_pos`, `openness_neg` and
+`openness_defect` layers, 60 m grid, 8 azimuths out to 1.2 km, in
+`scripts/process.py`). Plan curvature is not built yet.
+
 Complementarity against our existing ruggedness layer, measured on this DEM:
 
 | candidate | r with ruggedness | verdict |
@@ -170,6 +174,8 @@ positive openness; the source clips at zero.
 ## Two literature findings that challenge our current design
 
 **1. The near field dominates, and our kernels don't reflect that.**
+(Partly acted on since: a 1.5 km ruggedness variant, `ruggedness_near`, now
+ships beside the 5 km one. Nothing at 250 m yet.)
 Schirpke et al. (2013) fitted scenic-beauty distance-zone weights of
 **0.64 / 0.22 / 0.14** for 0–1.5 km / 1.5–10 km / 10–50 km. Two-thirds of
 perceived beauty comes from the nearest 1.5 km. Our 5 km and 10 km kernels put

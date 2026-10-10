@@ -2,6 +2,10 @@
 
 Scope narrowed to four regions. This is the concrete acquisition list.
 
+**Status:** only a subset of the WA region has been built so far, the Alpine
+Lakes Wilderness (`data/aoi/alpine-lakes.json`), with its own 60 km far-field
+buffer. Everything else below is the plan, not downloaded data.
+
 | AOI | Core bbox | With 60 km far-field buffer |
 |---|---|---|
 | **WA — Cascades + Olympics** | 45.5–49.0°N, 124.8–120.0°W | 45.0–49.6°N, 125.5–119.3°W |
@@ -155,13 +159,18 @@ Straightforward — Sonny 1″ covers both completely.
 
 **Total ≈ 15 GB**, of which the scoring DEM is ~6.5 GB.
 
+Imagery for the panorama comes on top of that (see
+[data-sources.md](data-sources.md#e-true-colour-imagery)). For Alpine Lakes
+alone it was ~0.8 GB of Sentinel-2 at 10 m and ~7.7 GB of NAIP at 2 m. NAIP is
+US-only; Sentinel-2 covers every target.
+
 Optional / later:
 - gHM for the built-up gate — WorldCover's built-up class likely suffices, skip
   initially
-- Kirmse prominence — **now used directly** (see docs/data-sources.md); the
-  recompute below remains the fallback if the unstated licence ever matters.
-  Recompute from the same GLO-30/Sonny mosaic with
-  `akirmse/mountains` rather than downloading the unlicensed CSV
+- Kirmse prominence — **used directly** for panorama peak labels (see
+  [data-sources.md](data-sources.md#topographic-prominence)). If its unstated
+  licence ever matters, recompute from the same GLO-30/Sonny mosaic with
+  `akirmse/mountains` instead
 - WA DNR lidar, swissALTI3D, IGN LiDAR HD, Kartverket 1 m — **rendering only**
 
 ---

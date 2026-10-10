@@ -316,5 +316,5 @@ catch a badly-tuned weight before you notice it by eye.
    One score, or one per month? Deferred, but the data (MODIS snow cover,
    public domain) is cheap if you want it later.
 5. **Kirmse's peak dataset has no stated license** — used with attribution for
-   panorama peak selection; recompute from GLO-30
-   with the open-source `akirmse/mountains` generator.
+   panorama peak selection. If that ever matters, recompute from GLO-30 with
+   the open-source `akirmse/mountains` generator.

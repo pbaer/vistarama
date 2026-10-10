@@ -1,8 +1,9 @@
 # Vistarama
 
 Scores how epic the view is from a given point (a trail, a summit, a campsite,
-a lakeshore) using open elevation, land-cover and imagery data. Covers the USA
-and Europe.
+a lakeshore) using open elevation, land-cover and imagery data. The data choices
+are made for the USA and Europe; one region, the Alpine Lakes Wilderness in
+Washington, is built so far.
 
 ## What it does
 
@@ -55,6 +56,13 @@ python scripts/serve.py
 
 Then open <http://127.0.0.1:8765/>.
 
+`prominence.py` needs one file fetched by hand first, because it sits behind a
+Google Drive confirm page: `AllPeaksProminenceP100Sorted.zip` (112 MB) from
+<http://www.andrewkirmse.com/prominence>, saved unchanged as
+`data/raw/prominence/kirmse_prominence.raw`. Without it the panorama still
+works, but every summit falls back to the dataset's 100 ft floor and far fewer
+get labels.
+
 ## Documentation
 
 | Doc | What's in it |
@@ -100,9 +108,24 @@ low, on the grounds that they cannot be epic by construction.
 
 ## "View from here" — interactive 3D
 
-Click **Pick a viewpoint** in the panel, then click the map. A pane opens at the
-bottom with a WebGL rendering of the surrounding terrain: **drag to look
-around, scroll to zoom, and use the eye slider to rise from 2 m to 2 km.**
+Click anywhere on the map (Alt-click opens a feature's tags instead). A pane
+opens at the bottom with a WebGL rendering of the surrounding terrain.
+
+- **Drag** to look around, **scroll** to zoom (fov 8° to 100°).
+- **Eye** slider: 2 m to 2 km above the ground. **Range**: 10 to 517 km,
+  default 120; 517 km is the farthest one 15,000 ft summit can see another
+  over the curve of the earth. **Haze**: from "nothing past 1 km" to none at
+  all, defaulting to a clear day for the viewpoint's altitude.
+- **Satellite / land cover** switches the surface between imagery and
+  WorldCover classes.
+- **Arrow keys or WASD** nudge the camera sideways without refetching
+  anything, keeping eye height above the ground (Shift for 100 m/s instead of
+  25). Past 300 m a warning says the foreground is no longer finely meshed;
+  `0` recentres.
+- **Snap up** jumps to the nearest higher summit (see below).
+- Hovering the panorama puts a red dot on the map, hovering the map puts one
+  on the panorama, and the map's cursor card gives distance and bearing from
+  the viewpoint. Drag the pane's top edge to resize it.
 
 This shares the geometry the view score `V` needs, so it doubles as a visual
 check on that machinery before the metric is wired up.
@@ -141,9 +164,21 @@ check on that machinery before the metric is wired up.
 - The mesh is **viewer-independent**, so changing eye height only moves the
   camera, with no refetch. Peak visibility is recomputed in the browser against
   the same height grid, so labels appear as you rise above obstructions.
-- Colour is ESA WorldCover × hillshade per vertex; **haze** is exponential
-  extinction toward a pale horizon colour in the fragment shader.
-- Raw WebGL, no framework: ~350 lines including the mat4 helpers.
+- The surface is imagery by default, sampled per fragment from four
+  observer-centred LOD squares (half-widths 2.5, 10, 30 km and the full range)
+  rendered in an azimuthal-equidistant frame around the viewpoint. NAIP wins
+  where it exists, Sentinel-2 fills the rest. In land-cover mode it is ESA
+  WorldCover × hillshade per vertex. **Haze** is exponential extinction toward
+  a pale horizon colour in the fragment shader.
+- When you zoom in, the screen resolves more than those squares hold (at
+  fov 8°, Cashmere from 9 km needs ~1.4 m/texel and the ladder had 14.6). Once
+  the view settles, up to four **focus patches** of 2048² are fetched where
+  they gain the most sharpness per screen pixel, from 2 m (the NAIP mosaic's
+  own resolution) up. They cost the same VRAM the ladder used to spend on a
+  zoomed-in 4096² near level, and fade out wherever they would be minified,
+  since they have no mipmaps.
+- Raw WebGL, no framework: `pano3d.js` is ~1,200 lines including the mat4
+  helpers.
 
 ### Peak labels
 
@@ -177,57 +212,64 @@ Filters, in order:
    has both "Mount Rainier" and "Columbia Crest" on the same summit, so they
    share a key saddle and report identical prominence. Equal prominence within
    600 m collapses to the nearer node.
-5. **At most 16 standing labels**, in prominence order, placed in a band under
+5. **At most 16 standing labels**, in prominence order, for summits standing
+   at least 40 m above the ridge in front of them. They sit in a band under
    the compass with a width-aware overlap test and a stem down to the summit.
-   Everything surviving is a marker that names itself on hover.
+   Everything surviving the filters gets a marker that names itself on hover.
 
 ### Performance
 
+Measured at a 1958×861 canvas, warm server:
+
 | | cost |
 |---|---|
-| pan / zoom | **~3 ms/frame** |
+| pan / zoom | **~3 ms/frame**: ~1.5 ms GL, ~1.4 ms label overlay |
 | mesh | ~1.7M vertices, ~3.7M triangles |
-| mesh build (server, warm) | 2.5 s |
-| imagery textures (4 LOD levels) | ~5.5 s |
+| mesh build (server) | ~1.8 s |
+| imagery textures (4 LOD levels, fetched alongside the mesh) | ~5.1 s |
+| click to finished panorama | ~5.4 s |
+| focus patches (4 × 2048², after the view settles) | ~1.8 s |
 
-Geometry is the cheap half: a modern GPU draws 3.7M triangles in a few
+Geometry is cheap: a modern GPU draws 3.7M triangles in a couple of
 milliseconds, so there is **no occlusion or frustum culling**. Adding it would
 optimise the wrong thing.
 
-The expensive half is the occlusion *test for peak labels*: up to 1000 summits
-each walking the ring table of `atan2`. That depends only on eye height, not
-on view direction, so it is **cached and invalidated only when the height
-slider moves**. That is why panning costs half what a height change does.
+The occlusion *test for peak labels* is the costly part: up to ~1000 summits,
+each walking the ring table with `atan2`. It depends only on eye height, not
+on view direction, so it is **cached and invalidated only when the eye height
+changes**.
 
 ### Summit snapping
 
-The viewpoint snaps to the highest **local maximum** within 100 m of the click,
-where local maximum means *strictly higher than all eight neighbours* rather
-than merely the highest cell in the window. On a smooth planar hillside the
-highest cell in any window is just the most uphill one, so snapping to it would
-walk the viewpoint up the slope for as long as the slope continues. Such a cell
-always has a higher uphill neighbour, so it fails the test and the click is
-left where it is.
+The viewpoint snaps to the highest **summit** within 150 m of the click, and
+never downhill. A summit (`_is_summit` in `panorama.py`) is a cell with:
 
-Two further guards, both added after testing:
+- **nothing higher within 90 m** (ties allowed, since a summit is often flat
+  across a few 30 m cells), and
+- a **≥ 1 m rise over the ring just outside that radius**, so sub-metre DEM
+  ripple on flat ground does not read as a landform. Before this guard, a
+  click on the Puget lowland snapped 70 m sideways for a gain of 0.3 m.
 
-- The candidate must clear its highest neighbour by **≥ 1 m**, or sub-metre DEM
-  ripple on flat ground reads as a summit. Before this, a click on the Puget
-  lowland snapped 70 m sideways for a gain of 0.3 m.
-- Distance is measured from the **clicked point**, not from its cell centre.
-  A click can sit half a cell from the centre, which let a "100 m" search
-  reach 114 m.
+The highest cell in a search window is the wrong test. On a smooth planar
+hillside that cell is just the most uphill one, so snapping to it would walk
+the viewpoint up the slope for as long as the slope continues. Under the test
+above, open slope always has higher ground within 90 m, so the click stays
+where it is. The Traps section below has the earlier, adjacent-cell version
+of this test, which rejected almost every real summit.
 
-Behaviour on a randomised sample of 600 points: 0.8% snap, max move 94.8 m, no
-downhill snaps, and every landing verified to be a true 8-neighbour maximum.
-Snapping is rare because apexes are sparse at 30 m resolution.
+Distance is measured from the **clicked point**, not from its cell centre. A
+click can sit half a cell from the centre, which let a "100 m" search reach
+114 m.
+
+On 600 random points in the core AOI: 3.7% snap, the largest move is 141 m,
+the smallest rise 1.5 m, and every landing passes the summit test.
 
 A **"Snap up" button** covers the rest: it searches out to 500 m and offers the
-nearest local maximum that is **higher than where you are**, since a nearer but
-lower summit is never a better viewpoint. It greys out when the current point
-is already a local maximum. The jump runs with the automatic snap disabled, so
-the viewpoint lands where the button said rather than being re-snapped to some
-other nearby summit.
+nearest summit that is **higher than where you are**, since a nearer but lower
+one is never a better viewpoint. It greys out when there is no such summit in
+range. The jump runs with the automatic snap disabled, so the viewpoint lands
+where the button said rather than being re-snapped to some other nearby
+summit.
 
 The distance lives in its own fixed-width slot with tabular numerals, so the
 button is the same width whether it reads "267 m" or "—" and the toolbar never
@@ -235,61 +277,81 @@ reflows as you move around.
 
 The map also shows **where the panorama camera is looking**: a wedge from the
 viewpoint spanning the horizontal field of view, with a dashed centre-bearing
-line, both updating live as you drag. The horizontal FOV is derived from the
-camera's vertical FOV and the canvas aspect, so at a 50° vertical FOV on a wide
-pane the wedge correctly spans 123°.
+line. It follows the camera 100 ms after the view stops changing rather than
+on every frame, since redrawing the map's canvas is what made panning choppy
+on a large map. The horizontal FOV is derived from the camera's vertical FOV
+and the canvas aspect, so at a 50° vertical FOV on a wide pane the wedge spans
+123°.
 
 ### Why snapping matters
 
-From Mt Stuart's nominal summit coordinate, the DEM cell 25 m to the NNW sits
-17 m higher. A 30 m DEM smooths a sharp summit and shifts its apex, so the
-nominal coordinate lands on the flank. At a 2 m eye height that bump walls off
-the entire northern horizon. Snapping moves 36.5 m to the true apex and the
-view opens from **0 visible peaks to 168**.
+Take the OSM node for Mount Stuart (`node/348974307`). The DEM cell under it
+is 2842.5 m, and the cell 30 m to its west is 11.2 m higher: a 30 m DEM smooths
+a sharp summit and shifts its apex, so a hand-placed summit node can land on
+the flank. Standing there at 2 m, that bump hides much of the view. Snapping
+moves 23.6 m to the apex and the number of marked peaks goes from **78 to 148**.
 
-The eye-height slider is the other lever on the same problem:
+The eye-height slider is the other lever on the same problem. Peaks marked
+in all directions from the unsnapped node, after the label filters, at 120 km
+range:
 
-| eye height (unsnapped) | peaks on screen | furthest |
-|---|---|---|
-| 2 m | 0 | — |
-| 10 m | 176 | 113.9 km |
-| 25 m | 444 (incl. Glacier Peak) | 113.9 km |
-| 200 m | 460 | 119.5 km |
+| eye height (unsnapped) | peaks marked |
+|---|---|
+| 2 m | 78 |
+| 10 m | 141 |
+| 25 m | 148 |
+| 200 m | 162 |
 
 Worth carrying into the `V` metric: sampling trail vertices at 30 m will show
 this same sensitivity, which is more evidence for keeping `R` as a stabiliser.
 
-Validated from Mt Stuart's summit against independently known coordinates:
+Checked from the snapped Stuart summit at 2 m. "Predicted" is computed with
+`pyproj` from published USGS summit coordinates and elevations; "rendered" is
+what the mesh and peak table report:
 
 | target | predicted | rendered |
 |---|---|---|
-| Glacier Peak | az 347.5°, el **+0.01°**, 72.6 km | az 347.5°, el +0.01°, 72.55 km |
-| Mount Daniel | az 296.3°, el −1.13°, 22.6 km | az 295.6°, el −1.11°, 23.21 km |
-| Mount Rainier | az 223.5°, el +0.57°, 95.0 km | az 223.4°, el +0.57°, 94.8 km |
+| Glacier Peak | az 347.5°, el **−0.00°**, 72.6 km | az 347.45°, el −0.001°, 72.55 km |
+| Mount Daniel | az 295.7°, el −1.15°, 23.1 km | az 295.58°, el −1.147°, 23.25 km |
+| Mount Rainier | az 223.6°, el +0.56°, 95.0 km | az 223.43°, el +0.557°, 94.87 km |
 
-Glacier Peak lands at +0.01°, on the horizon to within a hundredth of a degree,
-and only does so with the curvature term in place.
+Glacier Peak sits on the horizon to within a thousandth of a degree, and only
+does so with the curvature term in place.
 
 ## Layout
 
 ```
 docs/       design notes and data research
-scripts/    download / process / serve
-viewer/     Leaflet raw-data viewer (vendored, works offline)
-data/       see data/README.md
+scripts/
+  download.py     DEM, land cover, glaciers, OSM themes
+  imagery.py      Sentinel-2 and NAIP mosaics
+  prominence.py   joins Kirmse prominence onto OSM summits
+  process.py      mosaic, reproject, derive metrics, build tiles + manifest
+  tiles.py        XYZ pyramid writers (PNG and JPEG)
+  panorama.py     polar mesh, summit snapping, panorama textures
+  serve.py        local HTTP server and the /api endpoints
+  aoi.py, colormaps.py
+viewer/     Leaflet map + WebGL panorama (Leaflet vendored, works offline)
+data/       not in git; see data/README.md
 ```
 
 ## Pipeline
 
 ```
-raw (EPSG:4326)          3DEP DEM, ESA WorldCover, OSM via Overpass
-   ↓ mosaic + warp
+raw (as published)       3DEP DEM, ESA WorldCover, OSM via Overpass,
+                         Sentinel-2 (UTM), Kirmse prominence
+   ↓ mosaic + warp       (NAIP is warped straight into interim/ at 2 m)
 interim (EPSG:5070)      equal-area, so metres mean metres
    ↓ derive
-derived (EPSG:5070)      hillshade, slope, ruggedness σ, canopy/built-up density
+derived (EPSG:5070)      hillshade, slope, ruggedness, relief, openness,
+                         canopy/built-up density
    ↓ tile + simplify
-web (EPSG:3857)          XYZ PNG pyramid + zoom-tiered GeoJSON
+web (EPSG:3857)          XYZ pyramids (PNG, JPEG for imagery) + zoom-tiered
+                         GeoJSON + manifest
 ```
+
+The panorama does not use `web/`: `serve.py` builds its mesh and textures per
+request from `interim/` and `derived/`.
 
 The equal-area intermediate matters: computing the ruggedness kernel in
 lat/lon would vary its radius with latitude and fabricate a north–south
@@ -450,8 +512,8 @@ Each of these produced a plausible-looking but wrong result:
   either end). Recovering these took water areas from 3023 → 3635 features and
   protected areas from 46 → 165.
 - **Leaflet's default hit tolerance is 0**, so a 1 px line is hittable only
-  within half its own width. Hover, tooltips and the pointer cursor all depend
-  on it; set `tolerance` on the renderer (`L.canvas({tolerance: 12})`).
+  within half its own width. Hover and tooltips both depend on it; set
+  `tolerance` on the renderer (`L.canvas({tolerance: 12})`).
 - **`~transform * (x, y)` returns fractional cell coordinates with integers at
   cell *corners*, so the containing cell is `floor`, not `round`.** Using
   `round`/`np.rint` offsets every sample by half a cell (15 m at 30 m
@@ -530,20 +592,21 @@ Each of these produced a plausible-looking but wrong result:
 - **Standing height elects the wrong summit of a massif.** From Mount Stuart,
   Liberty Cap stands 2779 m above the ridge in front of it and Mount Rainier's
   own 4392 m summit only 2629 m (they look over slightly different ground 95 km
-  away), so ranking peaks by `stands` labels the mountain "Liberty Cap". Massif
-  suppression ranks by plain **elevation**, which has no such quirk: the high
-  point of a massif is the massif. `stands` is still right for the label budget,
-  which is a question about the view, not about the mountain.
-- **Peak clustering has to scale its radius with distance.** The same 3 km
-  between two summits is a distinct neighbouring mountain at 10 km and an
-  internal wrinkle at 95 km, so an absolute radius is wrong at one end or the
-  other. `MASSIF_FRAC = 0.15` of the observer distance absorbed 18 named
-  summits on Rainier's silhouette down to 1 (Columbia Crest, Liberty Cap, Point
-  Success, Little Tahoma, Gibraltar Rock, Steamboat Prow, Mount Fremont, the
-  Sluiskins, the Fays, Mother Mountain, Tolmie) while leaving every summit
-  within 2.4 km of Dragontail (Pandora's Box at 420 m, Witches Tower at 620 m)
-  untouched. Use `min(distA, distB)` for the radius: it keeps a near peak
-  silhouetted in front of a distant giant from being swallowed by it.
+  away), so ranking peaks by standing height labels the mountain "Liberty Cap".
+- **A clustering radius is wrong somewhere, however you scale it.** The same
+  3 km between two summits is a separate mountain at 10 km and an internal
+  wrinkle at 95 km. Scaling the radius to 15% of the observer distance
+  absorbed 18 named summits on Rainier's silhouette into one while leaving
+  Dragontail's close neighbours alone, but the 0.15 was fitted to Rainier and
+  meant nothing anywhere else. Both this and the standing-height ranking are
+  gone: "is this its own mountain" is what prominence measures (see Peak
+  labels).
+- **Check that a sort key reaches the sort.** The labels were meant to go out
+  in prominence order, but `visiblePeaks()` built its output objects without
+  the `prom` field, so the comparator saw the same fallback value for every
+  peak and the order stayed standing height. Nothing looked broken; 127 m
+  sub-summits simply held label slots while Mount Index (921 m) went
+  unlabelled.
 - **Cloud cover says nothing about data coverage.** A Sentinel-2 granule
   clipped by the edge of the swath reports 92% nodata and 0.001% cloud at the
   same time, because cloud percentage is computed over the pixels that exist.
@@ -636,6 +699,13 @@ Each of these produced a plausible-looking but wrong result:
   The first version of the hole test counted blue-dominant pixels below the
   horizon and flagged Colchuck Lake as a 13% failure. Forcing the sky shader to
   magenta makes "no terrain was drawn here" unambiguous.
+- **Don't place a detail texture by aiming at the screen centre.** The first
+  focus patch went wherever the centre ray hit the ground. Looking at Cashmere
+  Mountain from 9 km at fov 8°, that ray slipped past the summit and landed on
+  a ridge 67 km away, so the patch went there and Cashmere stayed at
+  14.6 m/texel. Sampling a grid across the screen and placing patches by total
+  gain fixed it, and planning around the patches already loaded keeps a 1° pan
+  from refetching them.
 
 ## What's not done
 
@@ -660,8 +730,13 @@ missing.
   2023 coverage exists for those quads in Planetary Computer's catalogue is
   unverified; if it does, it is a dedupe-key bug, and if not the options are
   histogram matching or falling back to Sentinel-2 there.
-- **Panorama load is ~7.4 s warm**, dominated by the four imagery textures
-  (~5.5 s). Profiling put ~55% of that in GDAL's `reproject` and ~40% in the
+- **Panorama load is ~5.4 s warm**, dominated by the four imagery textures
+  (~5.1 s). Profiling put ~55% of that in GDAL's `reproject` and ~40% in the
   windowed read. Two hypotheses were tested and both refuted: a process pool
   (GIL) gained almost nothing on 32 cores, and DEFLATE compression made it
   ~1.6× *slower*. Raising `WARP_THREADS` to 16 is the one thing that helped.
+- **NAIP is stored at 2 m, not its native 0.6 m.** At the tightest zoom
+  (fov 8°) the screen resolves ~1.4 m on terrain 9 km away, so close-up
+  imagery is still a little soft. Keeping 0.6 m for this AOI would be ~63 GB
+  of uncompressed RGB against 7.7 GB now; the alternative is fetching 0.6 m on
+  demand for the focus patches only.
