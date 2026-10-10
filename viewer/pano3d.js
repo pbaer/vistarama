@@ -955,7 +955,8 @@
     return merged;
   };
 
-  /** Visible peaks projected to screen, ranked by standing height. */
+  /** Visible peaks projected to screen, in standing-height order (callers
+   *  re-rank by prominence for labelling). */
   Pano3D.prototype.visiblePeaks = function () {
     if (!this.data) return [];
     const { mvp } = this.matrices();
@@ -973,7 +974,10 @@
       const cy = mvp[1] * wx + mvp[5] * wy + mvp[9] * wz + mvp[13];
       const sy = (1 - (cy / cw * 0.5 + 0.5)) * H;
       if (sy < -40 || sy > H + 40) continue;
-      out.push({ name: p.name, ele: p.ele, dist_km: p.dist_km,
+      // prom has to come through: app.js ranks the standing labels by it,
+      // and without it every peak fell back to the same floor value and the
+      // labels went out in standing-height order instead
+      out.push({ name: p.name, ele: p.ele, dist_km: p.dist_km, prom: p.prom,
                  stands: p.stands, volcano: p.volcano, x: sx, y: sy });
     }
     return out;
