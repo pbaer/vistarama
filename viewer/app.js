@@ -1186,61 +1186,45 @@ function clearPanoFovOnMap() {
   if (panoAxis) { map.removeLayer(panoAxis); panoAxis = null; }
   panoFovKey = '';
 }
-let picking = false;
 let panoMarker = null;
 let panoLatLng = null;
 let panoSeq = 0;
 
 const $ = (id) => document.getElementById(id);
 
-// Picking is intercepted on `document` in the CAPTURE phase rather than via
-// map.on('click'). Leaflet's popup binding calls stopPropagation() when a
-// feature is clicked, so the map's own click event never fires and the picker
-// silently did nothing whenever the cursor happened to be over a peak or a
-// trail. Capturing at the document level runs before any Leaflet handler, so
-// the pick works everywhere and no popup opens while armed.
+// A plain left click on the map picks a viewpoint. It is intercepted on
+// `document` in the CAPTURE phase rather than via map.on('click'): Leaflet's
+// popup binding calls stopPropagation() when a feature is clicked, so the
+// map's own click event never fires whenever the cursor happens to be over a
+// peak or a trail. Capturing at the document level runs before any Leaflet
+// handler, so the pick works everywhere. Alt-click is let through, so a
+// feature's full tag table is still one click away.
 let pickDownPt = null;
 
-function setPicking(on) {
-  picking = on;
-  $('pick-view').classList.toggle('armed', on);
-  $('pick-view').textContent = on ? 'Click the map…  (Esc to cancel)' : 'Pick a viewpoint';
-  map.getContainer().classList.toggle('picking', on);
-  if (on) {
-    document.addEventListener('mousedown', onPickDown, true);
-    document.addEventListener('click', onPickClick, true);
-    document.addEventListener('keydown', onPickKey, true);
-  } else {
-    pickDownPt = null;
-    document.removeEventListener('mousedown', onPickDown, true);
-    document.removeEventListener('click', onPickClick, true);
-    document.removeEventListener('keydown', onPickKey, true);
-  }
+function pickTarget(ev) {
+  const t = ev.target;
+  return map.getContainer().contains(t)
+    && !t.closest('.leaflet-control-container, .leaflet-popup');
 }
 
-function inMap(target) {
-  return map.getContainer().contains(target);
-}
+document.addEventListener('mousedown', (ev) => {
+  pickDownPt = ev.button === 0 && pickTarget(ev)
+    ? { x: ev.clientX, y: ev.clientY } : null;
+}, true);
 
-function onPickDown(ev) {
-  pickDownPt = inMap(ev.target) ? { x: ev.clientX, y: ev.clientY } : null;
-}
-
-function onPickKey(ev) {
-  if (ev.key === 'Escape') setPicking(false);
-}
-
-function onPickClick(ev) {
-  if (!inMap(ev.target)) return;
-  // a click that ends a pan should not drop a viewpoint; stay armed
-  if (pickDownPt && Math.hypot(ev.clientX - pickDownPt.x,
+document.addEventListener('click', (ev) => {
+  if (ev.button !== 0 || ev.altKey || !pickTarget(ev)) return;
+  // a click that ends a pan should not drop a viewpoint
+  if (!pickDownPt || Math.hypot(ev.clientX - pickDownPt.x,
     ev.clientY - pickDownPt.y) > 6) { pickDownPt = null; return; }
+  pickDownPt = null;
   ev.preventDefault();
   ev.stopPropagation();          // keeps Leaflet from opening a feature popup
+  // the second click of a double-click is a zoom, not a second pick
+  if (ev.detail > 1) return;
   const latlng = map.containerPointToLatLng(map.mouseEventToContainerPoint(ev));
-  setPicking(false);
   renderPanorama(latlng);
-}
+}, true);
 
 // Label budget. A wide view can put 400+ named summits on screen at once, and
 // labelling them all is unreadable — so only the most prominent get a standing
@@ -1359,7 +1343,7 @@ function updatePanoOverlay(p) {
   }
 
   scheduleMapSync(p);
-  scheduleTextureDetail();
+  scheduleFocus();
 
   $('pano-status').textContent =
     `bearing ${Math.round(p.yaw)}° · pitch ${p.pitch.toFixed(1)}° · fov `
@@ -1511,8 +1495,7 @@ async function renderPanorama(latlng, opts) {
         .then((r) => (r.ok ? r.json() : null))
         .then((sn) => {
           if (!sn || seq !== panoSeq || !pano || !pano.texWanted) return null;
-          return pano.loadTextures(sn.lat, sn.lon, AOI,
-            wantedTexDetail(pano.fov), rangeKm);
+          return pano.loadTextures(sn.lat, sn.lon, AOI, rangeKm);
         })
         .catch(() => null);
     }
@@ -1564,6 +1547,8 @@ async function renderPanorama(latlng, opts) {
   }
   stopTicker();
   $('pano-loading').hidden = true;
+  // the view may already be zoomed in from the previous point
+  scheduleFocus();
 
   // the viewpoint may have snapped to a nearby summit — show where it landed,
   // and leave a leader line back to where the click actually was
@@ -1581,8 +1566,8 @@ async function renderPanorama(latlng, opts) {
     ).addTo(map);
   }
 
-  // manual snap button: offers the nearest local maximum further out than the
-  // automatic snap reaches, and greys out when we are already standing on one
+  // manual snap button: offers the nearest higher summit, further out than the
+  // automatic snap reaches, and greys out when there is none within range
   const nm = header.nearest_max || {};
   const btn = $('pano-snapmax');
   if (nm.found) {
@@ -1628,39 +1613,29 @@ async function setPanoSurface(mode) {
     await pano.loadTextures(h.lat, h.lon, AOI);
   }
   pano.render();
+  scheduleFocus();
 }
 $('pano-surface').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-surface]');
   if (b) setPanoSurface(b.dataset.surface);
 });
 
-// Textures are built for the field of view in force at the time. Zooming in
-// raises the screen's angular resolution and makes every level too coarse at
-// once, so a narrower fov has to refetch a sharper ladder. Debounced, because
-// the wheel fires continuously and each refetch is several seconds of server
-// warping.
-const TEX_BASE_FOV = 55;
-let texDetailTimer = null;
+// The imagery ladder is built for a wide view. Zooming in raises the screen's
+// angular resolution past what it holds, so once the view settles a sharper
+// focus patch is fetched around whatever is in the middle of the screen (see
+// Pano3D.updateFocus). Debounced, because the wheel and the drag fire
+// continuously and each patch is a couple of seconds of server warping.
+const FOCUS_SETTLE_MS = 350;
+let focusTimer = null;
 
-function wantedTexDetail(fov) {
-  return Math.max(1, Math.min(2, Math.round(TEX_BASE_FOV / Math.max(fov, 1))));
-}
-
-function scheduleTextureDetail() {
-  if (!pano || !pano.data || !pano.texWanted || !imageryAvailable()) return;
-  const want = wantedTexDetail(pano.fov);
-  if (want === (pano.texDetail || 1)) return;
-  clearTimeout(texDetailTimer);
-  texDetailTimer = setTimeout(() => {
-    if (!pano || !pano.data) return;
-    const w = wantedTexDetail(pano.fov);
-    if (w === (pano.texDetail || 1)) return;
-    const h = pano.data.header;
-    $('pano-status').textContent = w > 1
-      ? 'zoomed in — refetching imagery at higher detail…'
-      : 'refetching imagery…';
-    pano.loadTextures(h.lat, h.lon, AOI, w);
-  }, 600);
+function scheduleFocus() {
+  if (!pano || !pano.data || !pano.texWanted || !pano.texReady
+    || !imageryAvailable()) return;
+  clearTimeout(focusTimer);
+  focusTimer = setTimeout(() => {
+    if (!pano || !pano.data || !pano.texWanted) return;
+    pano.updateFocus(AOI);
+  }, FOCUS_SETTLE_MS);
 }
 
 /** Publish the panel width and panorama height as CSS variables.
@@ -1920,7 +1895,6 @@ document.addEventListener('keyup', (ev) => {
 // a key held while the window loses focus never sends keyup
 window.addEventListener('blur', camStop);
 
-$('pick-view').addEventListener('click', () => setPicking(!picking));
 $('pano-close').addEventListener('click', () => {
   $('pano').hidden = true;
   if (panoMarker) { map.removeLayer(panoMarker); panoMarker = null; }
@@ -1959,7 +1933,7 @@ $('pano-snapmax').addEventListener('click', () => {
 const panoResize = () => { if (pano && !$('pano').hidden) pano.render(); };
 window.addEventListener('resize', panoResize);
 
-// no map.on('click') here — see setPicking() for why picking is captured on
+// no map.on('click') here — see pickTarget() for why picking is captured on
 // document instead
 
 // ---------------------------------------------------------------------------

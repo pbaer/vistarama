@@ -238,28 +238,7 @@ html, body {
 }
 
 /* ---- viewpoint tool ---- */
-.tool-btn {
-  width: 100%;
-  padding: 6px 8px;
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  background: var(--panel-2);
-  color: var(--text);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-.tool-btn:hover { border-color: var(--accent); }
-.tool-btn.armed {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #0d1013;
-  font-weight: 600;
-}
-.tool-hint { margin: 6px 0 0; font-size: 10.5px; color: var(--muted); }
-.leaflet-container.picking, .leaflet-container.picking .leaflet-interactive {
-  cursor: crosshair !important;
-}
+.tool-hint { margin: 0; font-size: 10.5px; color: var(--muted); }
 
 /* ---- panorama pane ---- */
 #pano {
@@ -601,11 +580,15 @@ body.pano-resizing { cursor: ns-resize; user-select: none; }
 
 .leaflet-container { background: #0d1013; }
 
-/* Leaflet adds .leaflet-interactive to the canvas while a feature is hovered.
-   Beat the container's `cursor: grab` so the cursor becomes a pointing hand
-   over anything clickable. */
+/* A left click anywhere on the map picks a viewpoint, so the cursor is a
+   crosshair throughout, including over features (Leaflet adds
+   .leaflet-interactive to the canvas while one is hovered). It only turns
+   into a grabbing hand while a pan is in progress. */
+.leaflet-container.leaflet-grab,
 .leaflet-container.leaflet-grab .leaflet-interactive,
-.leaflet-container canvas.leaflet-interactive { cursor: pointer; }
+.leaflet-container canvas.leaflet-interactive { cursor: crosshair; }
+body.leaflet-dragging .leaflet-container.leaflet-grab,
+body.leaflet-dragging .leaflet-container .leaflet-interactive { cursor: grabbing; }
 
 .leaflet-tooltip {
   background: rgba(29,33,38,.96);

@@ -338,9 +338,14 @@ def _adaptive_radii(dem, dem_transform, dem_crs, lat: float, lon: float,
 
 
 def texture_patch(sources: list[Path], lat: float, lon: float,
-                  half_m: float, size: int,
-                  quality: int = 86) -> tuple[bytes, list[str]]:
-    """A north-up square of imagery centred on the observer, as JPEG.
+                  half_m: float, size: int, quality: int = 86,
+                  cx: float = 0.0, cy: float = 0.0) -> tuple[bytes, list[str]]:
+    """A north-up square of imagery in the observer's frame, as JPEG.
+
+    The square is centred `cx`, `cy` metres east/north of the observer: zero
+    for the LOD ladder, and wherever the camera is pointing for the focus
+    patch. Either way the frame is the observer-centred AEQD below, so the
+    shader's lookup stays a plain offset and scale.
 
     The panorama draws this as a **world-space texture** rather than colouring
     each vertex, and that distinction is the whole reason high-resolution
@@ -396,7 +401,8 @@ def texture_patch(sources: list[Path], lat: float, lon: float,
     aeqd = (f"+proj=aeqd +lat_0={lat} +lon_0={lon} +x_0=0 +y_0=0 "
             f"+datum=WGS84 +units=m +no_defs")
     px = 2.0 * half_m / size
-    dst_transform = from_origin(-half_m, half_m, px, px)
+    x0, y0, x1, y1 = cx - half_m, cy - half_m, cx + half_m, cy + half_m
+    dst_transform = from_origin(x0, y1, px, px)
     shape = (size, size)
 
     rgb = np.zeros((3, size, size), dtype=np.uint8)
@@ -437,8 +443,7 @@ def texture_patch(sources: list[Path], lat: float, lon: float,
             # pull all 24745x23966 pixels of the Sentinel-2 mosaic per request;
             # `out_shape` serves it from the overview pyramid instead. The 1.4x
             # is slack for the rotation between the two frames.
-            sb = transform_bounds(aeqd, s.crs, -half_m, -half_m, half_m, half_m,
-                                  densify_pts=21)
+            sb = transform_bounds(aeqd, s.crs, x0, y0, x1, y1, densify_pts=21)
             win = from_bounds(*sb, transform=s.transform)
             n = int(size * 1.4)
             arr = s.read(indexes=[1, 2, 3], window=win, out_shape=(3, n, n),
@@ -672,12 +677,12 @@ def _is_summit(dem, r: int, c: int, px: float) -> bool:
 
 def _local_max_candidates(dem, transform, lat, lon, dem_crs, nodata,
                           radius_m: float):
-    """Every strict local maximum within `radius_m` of a lat/lon.
+    """Every summit within `radius_m` of a lat/lon.
 
-    Yields (z, row, col, distance_from_click). "Strict local maximum" means
-    higher than all eight neighbours by at least MIN_LOCAL_RISE_M — see
-    `snap_to_local_max` for why merely-highest-in-window is the wrong test.
-    Also reports whether the clicked cell is itself such a maximum.
+    Returns (candidates, clicked cell's height, whether the clicked cell is
+    itself a summit); each candidate is (z, row, col, distance_from_click).
+    "Summit" is `_is_summit` — see `snap_to_local_max` for why
+    merely-highest-in-window is the wrong test.
     """
     to_dem = Transformer.from_crs("EPSG:4326", dem_crs, always_xy=True)
     x, y = to_dem.transform(lon, lat)

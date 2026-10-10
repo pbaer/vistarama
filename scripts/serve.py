@@ -291,6 +291,10 @@ class Handler(SimpleHTTPRequestHandler):
             slug = q.get("slug", ["alpine-lakes"])[0]
             half_m = float(q.get("half_m", ["4000"])[0])
             size = min(4096, max(256, int(q.get("size", ["2048"])[0])))
+            # centre of the square, metres east/north of the observer; the
+            # LOD ladder is centred on the observer, the focus patch is not
+            cx = float(q.get("cx", ["0"])[0])
+            cy = float(q.get("cy", ["0"])[0])
             base = ROOT / "data"
             interim = base / "interim" / slug
             # priority order: the sharpest source that covers each pixel wins
@@ -308,7 +312,7 @@ class Handler(SimpleHTTPRequestHandler):
             # no hillshade: the imagery already carries real illumination, and
             # ours points 159 deg away from it (see texture_patch)
             jpeg, used = panorama.texture_patch(
-                sources, lat, lon, half_m, size)
+                sources, lat, lon, half_m, size, cx=cx, cy=cy)
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(jpeg)))

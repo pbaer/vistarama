@@ -117,8 +117,12 @@
     uniform float uHaze;
     uniform vec3 uHazeColor;
     uniform sampler2D uTex0, uTex1, uTex2, uTex3;
+    uniform sampler2D uTexF0, uTexF1, uTexF2, uTexF3;
     uniform vec4 uHalf;          // half-extent in metres of each level
     uniform float uTexMix;       // 0 = vertex colour, 1 = imagery
+    // focus patches, coarsest first: centre x, y, half, texel (0 = unused)
+    uniform vec4 uFocus0, uFocus1, uFocus2, uFocus3;
+    uniform float uPix;          // radians per device pixel
 
     vec3 sampleLevel(sampler2D t, float half_m) {
       vec2 uv = vWorld / (2.0 * half_m) + 0.5;
@@ -140,6 +144,18 @@
       return 1.0 - smoothstep(half_m * 0.72, half_m * 0.97, r);
     }
 
+    // A focus patch over whatever is beneath it (see Pano3D.updateFocus).
+    // It has no mipmaps, so it also fades out wherever it would be minified,
+    // which leaves those fragments to the mipmapped ladder.
+    vec3 focus(vec3 img, sampler2D t, vec4 f) {
+      if (f.w <= 0.0) return img;
+      vec2 d = (vWorld - f.xy) / f.z;
+      float w = 1.0 - smoothstep(0.88, 0.99, max(abs(d.x), abs(d.y)));
+      w *= 1.0 - smoothstep(1.3, 2.0, vDist * uPix / f.w);
+      vec2 uv = vec2(d.x, -d.y) * 0.5 + 0.5;
+      return mix(img, texture2D(t, clamp(uv, 0.0005, 0.9995)).rgb, w);
+    }
+
     void main() {
       vec3 base = vColor;
       if (uTexMix > 0.0) {
@@ -150,6 +166,11 @@
         img = mix(img, sampleLevel(uTex2, uHalf.z), wt(uHalf.z, r));
         img = mix(img, sampleLevel(uTex1, uHalf.y), wt(uHalf.y, r));
         img = mix(img, sampleLevel(uTex0, uHalf.x), wt(uHalf.x, r));
+        // focus patches last, so the finest one wins where they overlap
+        img = focus(img, uTexF0, uFocus0);
+        img = focus(img, uTexF1, uFocus1);
+        img = focus(img, uTexF2, uFocus2);
+        img = focus(img, uTexF3, uFocus3);
         base = mix(vColor, img, uTexMix);
       }
       // exponential extinction toward the haze colour — atmospheric perspective
@@ -256,7 +277,9 @@
     this.texWanted = true;
     this.texReady = false;
     this._texToken = 0;                  // discards textures from a stale point
-    this.tex = [0, 1, 2, 3].map(() => {
+    this.texSizes = null;
+    // four ladder levels, then the four focus patches
+    this.tex = [0, 1, 2, 3, 4, 5, 6, 7].map(() => {
       const t = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, t);
       // 1x1 grey placeholder so the sampler is always complete — an incomplete
@@ -269,6 +292,8 @@
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       return t;
     });
+    this.focusSlots = this.tex.slice(4).map((tex) =>
+      ({ tex, patch: null, pending: null, token: 0 }));
 
     this.yaw = 0;          // compass bearing the camera faces, degrees
     this.pitch = -4;       // degrees, positive = up
@@ -301,7 +326,7 @@
    *  ones sharpen the near field a second later, which is far better than a
    *  blank panorama until the last byte lands.
    */
-  Pano3D.prototype.loadTextures = function (lat, lon, slug, detail, rangeKm) {
+  Pano3D.prototype.loadTextures = function (lat, lon, slug, rangeKm) {
     const gl = this.gl;
     // Four levels on a geometric ladder rather than three. The step between
     // levels is what sets how blurry the far side of a handover looks — the
@@ -334,29 +359,27 @@
     // largest on screen, and where NAIP-sharp foreground gives way. L0 at 2048
     // is already 2.44 m/texel, which is what NAIP at 2 m actually carries;
     // more there would only interpolate.
-    // `detail` scales the whole ladder when the user zooms in. The textures
-    // are built for a given field of view — narrowing the fov raises the
-    // screen's angular resolution proportionally and makes every level too
-    // coarse at once, which is why zooming showed blur the wide view did not.
-    // Capped at 4096 per level: 8192 would be 200 MB of VRAM for one level.
-    // Per-level ceiling, and the outermost level is pinned to 2048.
     //
-    // Four 4096 textures with mipmaps is ~268 MB of VRAM on top of a 1.7M
-    // vertex mesh, and at that point the last upload came back corrupt: the
-    // far level read back as 26% pure red, RGB (121, 2, 2), with green and
-    // blue at zero — a partially uploaded image, not imagery. The server's
-    // JPEG for the same request is provably clean at both sizes, so this is
-    // the browser side running out of room. The far level is the cheapest one
-    // to give up: it spans 240 km, which the haze has already washed out.
-    // L2 joins L1 at 4096: it now carries everything from ~7 km to ~29 km,
-    // which is most of what you actually look at, and at 2048 that band was
-    // 19-68 m/texel against source imagery of 2 m.
-    const caps = [4096, 4096, 4096, 2048];
-    const sizes = [2048, 4096, 4096, 2048]
-      .map((s, i) => Math.min(s * (detail || 1), caps[i], max));
-    this.texDetail = detail || 1;
-    this.texFov = this.fov;
+    // VRAM is the ceiling. Four 4096 textures with mipmaps on top of a 1.7M
+    // vertex mesh made the last upload come back corrupt: the far level read
+    // back as 26% pure red, RGB (121, 2, 2), with green and blue at zero — a
+    // partially uploaded image, not imagery. The server's JPEG for the same
+    // request is provably clean, so this is the browser side running out of
+    // room. The far level is the cheapest one to give up: it spans 240 km,
+    // which the haze has already washed out. L2 joins L1 at 4096: it carries
+    // everything from ~7 km to ~29 km, which is most of what you look at.
+    //
+    // Zooming in used to scale this whole ladder up, but with every other
+    // level already at its cap that only ever enlarged L0, interpolating the
+    // 2 m source to 1.2 m. Zoom detail now comes from the focus patch instead
+    // (updateFocus), which spends the same 64 MB where the camera is pointing.
+    const sizes = [2048, 4096, 4096, 2048].map((s) => Math.min(s, max));
+    this.texSizes = sizes;
     const token = ++this._texToken;
+    // focus patches belong to the old viewpoint's frame
+    for (const sl of this.focusSlots) {
+      sl.token++; sl.patch = null; sl.pending = null;
+    }
 
     return Promise.all(this.texHalf.map((half, i) => new Promise((resolve) => {
       const img = new Image();
@@ -378,6 +401,203 @@
       img.src = `/api/texture?lat=${lat}&lon=${lon}&slug=${slug}`
         + `&half_m=${Math.round(half)}&size=${sizes[i]}`;
     })));
+  };
+
+  // Focus patches: a few extra squares of imagery placed where the camera is
+  // looking, at the source's native resolution or whatever the screen needs.
+  //
+  // The ladder is observer-centred, so its resolution can only fall with
+  // distance, while the resolution the screen *needs* also scales with zoom:
+  // at fov 8 one device pixel covers 0.8 m at 5 km, and the ladder offers
+  // 4.9 m/texel there. Enlarging the ladder cannot close that gap within the
+  // VRAM ceiling, because it spends its texels on every direction at once and
+  // a zoomed view only sees a few degrees of them.
+  //
+  // Four 2048 patches rather than one 4096: the same 64 MB, but a single
+  // patch has to pick one distance. Aiming it at the screen centre failed on
+  // the first real view tried, looking at Cashmere from 5 km at fov 8: the
+  // centre ray slipped past the summit and landed on a ridge 67 km away, so
+  // the patch went there and Cashmere stayed at 4.9 m/texel. Several smaller
+  // patches, placed by what they gain across the whole screen, can serve the
+  // near mountain and the far skyline at once.
+  const FOCUS_N = 4;
+  const FOCUS_SIZE = 2048;
+  // The NAIP mosaic's own resolution. Finer than this the server can only
+  // interpolate, so a patch never asks for it.
+  const FOCUS_MIN_TEXEL_M = 2;
+  // The planner's screen sampling grid.
+  const FOCUS_GRID_X = 32, FOCUS_GRID_Y = 16;
+  // The shader fades a patch out where it would be minified by more than this
+  // (it has no mipmaps), so the planner counts those fragments as uncovered.
+  const FOCUS_MAX_MINIFY = 1.3;
+  // Stop adding patches once the best one gains less than this, in mean
+  // log-resolution per screen sample.
+  const FOCUS_MIN_GAIN = 0.02;
+
+  /** Radians per device pixel, vertically. */
+  Pano3D.prototype.pixAngle = function () {
+    return 2 * Math.tan(this.fov * Math.PI / 360) / Math.max(1, this.canvas.height);
+  };
+
+  /** Texel size, in metres, of the ladder level that fully covers radius r. */
+  Pano3D.prototype.ladderTexel = function (r) {
+    const sizes = this.texSizes || [2048, 4096, 4096, 2048];
+    for (let i = 0; i < 3; i++) {
+      if (r < this.texHalf[i] * 0.72) return 2 * this.texHalf[i] / sizes[i];
+    }
+    return 2 * this.texHalf[3] / sizes[3];
+  };
+
+  /** Ground samples under a grid of screen points: where each lands, the
+   *  texel the screen needs there, and the texel the ladder currently gives. */
+  Pano3D.prototype._focusSamples = function () {
+    const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
+    const pix = this.pixAngle();
+    const s = [];
+    for (let j = 0; j < FOCUS_GRID_Y; j++) {
+      for (let i = 0; i < FOCUS_GRID_X; i++) {
+        const hit = this.pickGround((i + 0.5) * W / FOCUS_GRID_X,
+          (j + 0.5) * H / FOCUS_GRID_Y);
+        if (!hit) continue;
+        const a = hit.az * Math.PI / 180;
+        s.push({ x: hit.dist * Math.sin(a), y: hit.dist * Math.cos(a),
+                 need: Math.max(FOCUS_MIN_TEXEL_M, hit.dist * pix),
+                 eff: this.ladderTexel(hit.dist) });
+      }
+    }
+    return s;
+  };
+
+  function focusCovers(p, q) {
+    return Math.abs(q.x - p.x) <= p.half && Math.abs(q.y - p.y) <= p.half
+      && q.need <= p.texel * FOCUS_MAX_MINIFY;
+  }
+
+  /** Summed gain in log-resolution over the samples patch p would improve. */
+  function focusGain(p, s) {
+    let gain = 0;
+    for (const q of s) {
+      if (!focusCovers(p, q)) continue;
+      const g = Math.log(q.eff / Math.max(p.texel, q.need));
+      if (g > 0) gain += g;
+    }
+    return gain;
+  }
+
+  function focusApply(p, s) {
+    for (const q of s) {
+      if (focusCovers(p, q)) q.eff = Math.min(q.eff, Math.max(p.texel, q.need));
+    }
+  }
+
+  /** The new patch that would gain the most. Candidates are centred on the
+   *  samples themselves, at the texel that sample needs and at 2x and 4x
+   *  that, which trades sharpness for coverage. */
+  function focusBest(s) {
+    let best = null;
+    for (const c of s) {
+      if (c.need * 1.25 >= c.eff) continue;        // already sharp enough here
+      for (const t of [c.need, c.need * 2, c.need * 4]) {
+        const p = { x: c.x, y: c.y, half: t * FOCUS_SIZE / 2, texel: t };
+        p.gain = focusGain(p, s);
+        if (!best || p.gain > best.gain) best = p;
+      }
+    }
+    return best;
+  }
+
+  /** Which focus slots to keep and which new patches to fetch for this view.
+   *
+   *  Greedy over screen samples: each stands for an equal area of screen, so
+   *  summing gain over them maximises sharpness where the pixels are rather
+   *  than where the ground is. Patches already loaded (or loading) go first,
+   *  and keep their slot as long as they still earn it. Planning from scratch
+   *  re-picked slightly different centres on every small pan and refetched
+   *  half the patches for a 2 degree turn. A kept patch is only swapped out
+   *  when a new one would earn at least twice as much. */
+  Pano3D.prototype.focusPlan = function () {
+    if (!this.data || !this.texSizes) return { keep: [], fetch: [] };
+    const s = this._focusSamples();
+    const minGain = FOCUS_MIN_GAIN * s.length;
+    const have = this.focusSlots
+      .map((sl, i) => ({ i, p: sl.pending || sl.patch })).filter((h) => h.p);
+    const keep = [];
+    while (have.length) {
+      let bk = -1, bg = 0;
+      have.forEach((h, k) => {
+        const g = focusGain(h.p, s);
+        if (g > bg) { bg = g; bk = k; }
+      });
+      if (bk < 0 || bg < minGain) break;
+      const h = have.splice(bk, 1)[0];
+      h.gain = bg;
+      keep.push(h);
+      focusApply(h.p, s);
+    }
+    const fetch = [];
+    while (keep.length + fetch.length < FOCUS_N) {
+      const c = focusBest(s);
+      if (!c || c.gain < minGain) break;
+      fetch.push(c);
+      focusApply(c, s);
+    }
+    // Slots full: swap out the weakest kept patch while a new one would earn
+    // twice as much. The candidate's gain is counted with the weakest still
+    // applied, so it can only understate what the swap is worth.
+    while (keep.length && keep.length + fetch.length >= FOCUS_N) {
+      const c = focusBest(s);
+      const weakest = keep.reduce((a, b) => (b.gain < a.gain ? b : a));
+      if (!c || c.gain < minGain || c.gain < 2 * weakest.gain) break;
+      keep.splice(keep.indexOf(weakest), 1);
+      fetch.push(c);
+      focusApply(c, s);
+    }
+    return { keep: keep.map((h) => h.i), fetch };
+  };
+
+  /** Bring the focus patches in line with the current view. A slot that is
+   *  not kept carries on showing its old patch until a new one replaces it:
+   *  that is still correctly registered imagery, just aimed somewhere less
+   *  useful. */
+  Pano3D.prototype.updateFocus = function (slug) {
+    const { keep, fetch } = this.focusPlan();
+    const slots = this.focusSlots;
+    // empty slots first, then ones holding a patch this view no longer uses
+    const free = slots.map((sl, i) => i).filter((i) => !keep.includes(i))
+      .sort((a, b) => Number(!!slots[a].patch) - Number(!!slots[b].patch));
+    const gl = this.gl;
+    const h = this.data && this.data.header;
+    return Promise.all(fetch.slice(0, free.length).map((want, n) => {
+      const sl = slots[free[n]];
+      const token = ++sl.token;
+      const vp = this._texToken;
+      sl.pending = want;
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          if (token !== sl.token || vp !== this._texToken) return resolve(false);
+          gl.bindTexture(gl.TEXTURE_2D, sl.tex);
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
+          // No mipmaps: they would add a third to the patches' 64 MB, and
+          // that third is what tips the total over the VRAM ceiling described
+          // in loadTextures. The shader fades a patch out wherever it would
+          // be minified instead, so the ladder's mipmaps carry those fragments.
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          sl.patch = want;
+          sl.pending = null;
+          this.render();
+          resolve(true);
+        };
+        img.onerror = () => {
+          if (token === sl.token) sl.pending = null;
+          resolve(false);
+        };
+        img.src = `/api/texture?lat=${h.lat}&lon=${h.lon}&slug=${slug}`
+          + `&half_m=${Math.round(want.half)}&size=${FOCUS_SIZE}`
+          + `&cx=${Math.round(want.x)}&cy=${Math.round(want.y)}`;
+      });
+    }));
   };
 
   Pano3D.prototype.load = function (header, buffer) {
@@ -597,6 +817,19 @@
       gl.bindTexture(gl.TEXTURE_2D, this.tex[i]);
       gl.uniform1i(gl.getUniformLocation(this.terrainProg, `uTex${i}`), i);
     }
+    // focus patches bound coarsest first, so the finest is blended last
+    const patches = this.focusSlots.filter((sl) => sl.patch)
+      .sort((a, b) => b.patch.texel - a.patch.texel);
+    for (let i = 0; i < 4; i++) {
+      const sl = patches[i];
+      gl.activeTexture(gl.TEXTURE4 + i);
+      gl.bindTexture(gl.TEXTURE_2D, sl ? sl.tex : this.tex[4 + i]);
+      gl.uniform1i(gl.getUniformLocation(this.terrainProg, `uTexF${i}`), 4 + i);
+      const p = sl && sl.patch;
+      gl.uniform4f(gl.getUniformLocation(this.terrainProg, `uFocus${i}`),
+        p ? p.x : 0, p ? p.y : 0, p ? p.half : 1, p ? p.texel : 0);
+    }
+    gl.uniform1f(gl.getUniformLocation(this.terrainProg, 'uPix'), this.pixAngle());
     gl.uniform4f(gl.getUniformLocation(this.terrainProg, 'uHalf'),
       this.texHalf[0], this.texHalf[1], this.texHalf[2], this.texHalf[3]);
     gl.uniform1f(gl.getUniformLocation(this.terrainProg, 'uTexMix'),
