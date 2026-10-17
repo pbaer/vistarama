@@ -51,9 +51,27 @@ ROOT = Path(__file__).resolve().parents[1]
 
 TRAIL_SPACING_M = 50.0
 PEAK_SNAP_M = 150.0
+# Best point refinement (see refine_bests): around each way's REFINE_TOP best
+# 50 m samples, the path is searched every REFINE_STEP_M out to REFINE_SPAN_M
+# either side, then every metre out to REFINE_FINE_M around the winner.
+REFINE_TOP = 2
+REFINE_SPAN_M = 25.0
+REFINE_STEP_M = 5.0
+REFINE_FINE_M = 4.0
 POOL_WORKERS = 8
 # Themes that can be scored, and how their geometry becomes sample points.
-SCORABLE = {"trails": "line", "peaks": "summit", "passes": "point"}
+SCORABLE = {"trails": "line", "peaks": "summit", "passes": "point",
+            "water_areas": "shore"}
+
+# Lakes are scored along their shoreline, like a trail along its path. Only
+# standing water of at least LAKE_MIN_AREA_M2: a pond is not a destination,
+# and 0.5 ha (about 80 m across) still keeps the small named alpine lakes
+# (Divide Lake, Little Caroline Lake, Upper Florence Lake are all under 1 ha).
+# Rivers, stormwater basins, wastewater and the like are not lakes at all,
+# nor is anything salt or tidal (see lake_area). The OSM download returns
+# whole features, so a lake crossing its edge (Lake Chelan) is still complete.
+LAKE_MIN_AREA_M2 = 5000.0
+LAKE_WATER_TYPES = {None, "lake", "pond", "reservoir"}
 
 _pool: ProcessPoolExecutor | None = None
 _pool_lock = threading.Lock()
@@ -72,6 +90,10 @@ def version() -> str:
     """The point score's version plus this module's sampling parameters."""
     import vscore
     own = {"trail_spacing_m": TRAIL_SPACING_M, "peak_snap_m": PEAK_SNAP_M,
+           "peak_snap": "climb",
+           "refine": [REFINE_TOP, REFINE_SPAN_M, REFINE_STEP_M, REFINE_FINE_M],
+           "lakes": [LAKE_MIN_AREA_M2, sorted(map(str, LAKE_WATER_TYPES))],
+           "ring_wrap": True,
            "trail_sample": "midpoints", "trail_group": "same-name-connected",
            # the record layout: bump when records gain fields the viewer needs
            "record": 2, "elev_step_m": ELEV_STEP_M,
@@ -203,14 +225,76 @@ def _lines(geom: dict) -> list[list]:
     raise ValueError(f"cannot sample a {geom['type']} as a trail")
 
 
+def lake_area(feat: dict) -> float | None:
+    """A water area's surface in m² if it counts as a lake, else None."""
+    props = feat.get("properties") or {}
+    if props.get("natural") != "water" or props.get("water") not in LAKE_WATER_TYPES:
+        return None
+    # closed fresh water only: never the sea, a salt lagoon or a tidal flat
+    # (ocean is natural=coastline, not natural=water, but inlets and lagoons
+    # can be tagged as water)
+    if props.get("salt") == "yes" or props.get("tidal") == "yes":
+        return None
+    from shapely.geometry import shape
+    from shapely.ops import transform
+    from pyproj import Transformer
+    g = shape(feat["geometry"])
+    if not g.is_valid:
+        g = g.buffer(0)
+    # EPSG:5070 is equal-area, so this is the true surface
+    to = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True).transform
+    a = transform(to, g).area
+    return a if a >= LAKE_MIN_AREA_M2 else None
+
+
+def shoreline(geom: dict) -> dict:
+    """A lake polygon's outer rings as a MultiLineString: where you can walk.
+    Islands (inner rings) are left out."""
+    polys = [geom["coordinates"]] if geom["type"] == "Polygon" else geom["coordinates"]
+    return {"type": "MultiLineString", "coordinates": [p[0] for p in polys]}
+
+
 def trail_samples(geom: dict, spacing: float = TRAIL_SPACING_M):
     """Points at the middle of each `spacing` piece along a line, plus its
     geodesic length. A line shorter than `spacing` gets one sample, halfway."""
+    pts, total, _pos = trail_samples_pos(geom, spacing)
+    return pts, total
+
+
+def _walker(line):
+    """(length, f) for one line of lon/lat vertices: f(t) is the point t
+    metres along it (geodesic), as (lat, lon). A closed line (a shoreline)
+    wraps around; an open one is clamped to its ends."""
     from pyproj import Geod
     g = Geod(ellps="WGS84")
-    pts = []
+    lons = [c[0] for c in line]
+    lats = [c[1] for c in line]
+    az, _baz, seg = g.inv(lons[:-1], lats[:-1], lons[1:], lats[1:])
+    seg = list(seg) if hasattr(seg, "__iter__") else [seg]
+    az = list(az) if hasattr(az, "__iter__") else [az]
+    length = float(sum(seg))
+    closed = len(line) > 2 and line[0][0] == line[-1][0] and line[0][1] == line[-1][1]
+
+    def at(t: float):
+        t = t % length if closed and length > 0 else min(max(t, 0.0), length)
+        acc, j = 0.0, 0
+        while j < len(seg) - 1 and acc + seg[j] < t:
+            acc += seg[j]
+            j += 1
+        lon, lat, _ = g.fwd(lons[j], lats[j], az[j], t - acc)
+        return (lat, lon)
+    at.closed = closed
+    return length, at
+
+
+def trail_samples_pos(geom: dict, spacing: float = TRAIL_SPACING_M):
+    """trail_samples, plus where each sample sits: (line index, metres along
+    that line), so a search can move along the path from it."""
+    from pyproj import Geod
+    g = Geod(ellps="WGS84")
+    pts, pos = [], []
     total = 0.0
-    for line in _lines(geom):
+    for li, line in enumerate(_lines(geom)):
         lons = [c[0] for c in line]
         lats = [c[1] for c in line]
         az, _baz, seg = g.inv(lons[:-1], lats[:-1], lons[1:], lats[1:])
@@ -234,7 +318,8 @@ def trail_samples(geom: dict, spacing: float = TRAIL_SPACING_M):
                 j += 1
             lon, lat, _ = g.fwd(lons[j], lats[j], az[j], t - acc)
             pts.append((lat, lon))
-    return pts, total
+            pos.append((li, t))
+    return pts, total, pos
 
 
 # ---- elevation ------------------------------------------------------------
@@ -331,6 +416,52 @@ def elevation_stats(slug: str, geoms: list[dict]) -> dict:
             "gain_m": round(gain)}
 
 
+def climb_to_summit(slug: str, lat: float, lon: float,
+                    radius_m: float = PEAK_SNAP_M) -> tuple[float, float, float]:
+    """The top of the hill a peak's node stands on: (lat, lon, metres moved).
+
+    Steepest ascent over the DEM's cells from the node's cell, each step to
+    the highest of the eight neighbours while it is strictly higher, ending
+    at the first cell no neighbour exceeds. The result is that cell's centre,
+    which is the highest point of the bilinear surface the score samples, so
+    the observer stands on the summit rather than on its flank.
+
+    Climbing, rather than taking the highest summit within the radius, keeps
+    a peak on its own top: the radius rule moved 27 peaks onto a different,
+    higher summit nearby (Guye Peak North and Middle both onto one point).
+    When the climb leaves the radius — a pinnacle the 30 m DEM does not
+    resolve, on a slope that keeps rising into another mountain — the node is
+    scored where it is: slightly low, rather than the wrong mountain.
+    """
+    import numpy as np
+    from pyproj import Transformer
+    dem, _bad, inv, to_dem = _dem(slug)
+    tf = ~inv
+    X, Y = _project(slug, [lon], [lat])
+    fc, fr = inv * (X[0], Y[0])
+    c, r = int(math.floor(fc)), int(math.floor(fr))
+    H, W = dem.shape
+    if not (1 <= r < H - 1 and 1 <= c < W - 1) or not np.isfinite(dem[r, c]):
+        return lat, lon, 0.0
+    while True:
+        win = dem[r - 1:r + 2, c - 1:c + 2]
+        win = np.where(np.isfinite(win), win, -np.inf)
+        j = np.unravel_index(int(np.argmax(win)), win.shape)
+        if j == (1, 1) or win[j] <= dem[r, c]:
+            break
+        r, c = r + int(j[0]) - 1, c + int(j[1]) - 1
+        if not (1 <= r < H - 1 and 1 <= c < W - 1):
+            return lat, lon, 0.0
+    px = abs(tf.a)
+    moved = math.hypot(c + 0.5 - fc, r + 0.5 - fr) * px
+    if moved > radius_m:
+        return lat, lon, 0.0
+    x, y = tf * (c + 0.5, r + 0.5)
+    lon2, lat2 = Transformer.from_crs(to_dem.target_crs, "EPSG:4326",
+                                      always_xy=True).transform(x, y)
+    return float(lat2), float(lon2), round(moved, 1)
+
+
 def _osm_ele(props: dict) -> float | None:
     try:
         return float(str(props.get("ele", "")).split()[0].replace(",", ""))
@@ -400,27 +531,37 @@ def build_item(slug: str, theme: str, fid: str) -> dict:
     if kind == "line":
         members = trail_group(slug, fid)
         geoms = [_raw_feature(slug, theme, w)["geometry"] for w in members]
-        pts, length, counts = [], 0.0, []
+        pts, length, counts, pos = [], 0.0, [], []
         for g in geoms:
-            p, ln = trail_samples(g)
+            p, ln, ps = trail_samples_pos(g)
             pts += p
             length += ln
+            pos += ps
             counts.append(len(p))       # which samples belong to which way
         xs = [c[0] for g in geoms for line in _lines(g) for c in line]
         ys = [c[1] for g in geoms for line in _lines(g) for c in line]
         item.update({"key": _group_key(members), "members": members,
                      "geoms": geoms, "points": pts, "length_m": length,
-                     "way_counts": counts,
+                     "way_counts": counts, "sample_pos": pos,
+                     "bbox": [min(xs), min(ys), max(xs), max(ys)]})
+    elif kind == "shore":
+        area = lake_area(feat)
+        if area is None:
+            raise ValueError("not a lake (standing fresh water of at least "
+                             f"{LAKE_MIN_AREA_M2 / 10000:g} ha)")
+        shore = shoreline(feat["geometry"])
+        pts, length, pos = trail_samples_pos(shore)
+        xs = [c[0] for line in shore["coordinates"] for c in line]
+        ys = [c[1] for line in shore["coordinates"] for c in line]
+        item.update({"key": fid, "members": [fid], "geoms": [shore],
+                     "points": pts, "length_m": length, "way_counts": [len(pts)],
+                     "sample_pos": pos, "area_m2": area,
                      "bbox": [min(xs), min(ys), max(xs), max(ys)]})
     else:
         lon, lat = feat["geometry"]["coordinates"][:2]
         moved = 0.0
         if kind == "summit":
-            import panorama
-            d, crs, tf, _b, nd = panorama._read_full(_paths(slug)[0])
-            s = panorama.snap_to_local_max(d, tf, crs, lat, lon, nd, PEAK_SNAP_M)
-            if s["snapped"]:
-                lat, lon, moved = s["lat"], s["lon"], s["moved_m"]
+            lat, lon, moved = climb_to_summit(slug, lat, lon)
         item.update({"key": fid, "points": [(lat, lon)], "snapped_m": moved,
                      "ele_osm": _osm_ele(props)})
     return item
@@ -428,27 +569,48 @@ def build_item(slug: str, theme: str, fid: str) -> dict:
 
 def finish_record(item: dict, vals: list[float], elapsed_s: float) -> dict:
     rec = {"id": item["key"], "theme": item["theme"], "name": item["name"],
-           "version": version(), "eye_m": 2.0, "kind": "line"
-           if item["kind"] == "line" else "point"}
-    if item["kind"] == "line":
+           "version": version(), "eye_m": 2.0,
+           "kind": item["kind"] if item["kind"] in ("line", "shore") else "point"}
+    if item["kind"] in ("line", "shore"):
         pts = item["points"]
         srt = sorted(vals)
         best = max(range(len(vals)), key=lambda i: vals[i])
+        refined = [b for b in item.get("refined") or [] if b]
+        top = max(refined, key=lambda b: b["V"]) if refined else {
+            "lat": pts[best][0], "lon": pts[best][1], "V": vals[best]}
+        if item["kind"] == "line":
+            rec.update({"members": item["members"], "n_ways": len(item["members"])})
         rec.update({
-            "members": item["members"], "n_ways": len(item["members"]),
             "length_m": round(item["length_m"], 1),
             "spacing_m": TRAIL_SPACING_M, "n": len(vals),
             "V": sum(vals) / len(vals), "V_median": srt[len(srt) // 2],
-            "V_min": srt[0], "V_max": srt[-1],
-            "best": {"lat": pts[best][0], "lon": pts[best][1], "V": vals[best]},
+            "V_min": srt[0], "V_max": max(srt[-1], top["V"]),
+            # the highest point found anywhere on the path, not just at a
+            # 50 m sample: see refine_bests
+            "best": {"lat": round(top["lat"], 7), "lon": round(top["lon"], 7),
+                     "V": top["V"]},
             "bbox": [round(x, 6) for x in item["bbox"]],
             "samples": [[round(la, 6), round(lo, 6), round(v, 4)]
                         for (la, lo), v in zip(pts, vals)],
         })
-        if len(item["members"]) > 1:
+        if item["kind"] == "shore":
+            # the lake's surface: the shoreline's median DEM height (hydro-
+            # flattened lakes sit level, and the median ignores a cliffy edge)
+            X, Y = _project(item["slug"], [p[1] for p in pts], [p[0] for p in pts])
+            z = _dem_z(item["slug"], X, Y)
+            z = sorted(v for v in z if v == v)
+            ele = round(z[len(z) // 2], 1) if z else None
+            rec.update({"area_m2": round(item["area_m2"]), "ele_m": ele,
+                        "ele_min_m": ele, "ele_max_m": ele})
+        elif len(item["members"]) > 1:
             rec["way_stats"] = way_stats(item["members"], item["way_counts"],
                                          rec["samples"])
-        rec.update(elevation_stats(item["slug"], item["geoms"]))
+            for wid, b in zip(item["members"], item.get("refined") or []):
+                if b and wid in rec["way_stats"]:
+                    rec["way_stats"][wid]["best"] = {
+                        "lat": round(b["lat"], 7), "lon": round(b["lon"], 7), "V": b["V"]}
+        if item["kind"] == "line":
+            rec.update(elevation_stats(item["slug"], item["geoms"]))
     else:
         lat, lon = item["points"][0]
         X, Y = _project(item["slug"], [lon], [lat])
@@ -464,6 +626,89 @@ def finish_record(item: dict, vals: list[float], elapsed_s: float) -> dict:
     rec["computed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rec["elapsed_s"] = round(elapsed_s, 2)
     return rec
+
+
+def refine_bests(slug: str, items: list[dict], vals_by_item: list[list[float]]) -> None:
+    """Find each way's highest-V point on the path itself, not just at a sample.
+
+    The 50 m samples set the trail's average; its best point deserves a closer
+    look, since V can change a lot within 50 m (a step onto a shoulder opens a
+    view). Around each way's REFINE_TOP best samples the path is scored every
+    REFINE_STEP_M out to REFINE_SPAN_M either side, and around the best of
+    those every metre out to REFINE_FINE_M. Points stay on the trail's own
+    geometry. Sets item["refined"]: one {lat, lon, V} per member way (None
+    for a way with no samples). Two batched scoring calls for all items.
+    """
+    def offsets(span, step):
+        n = int(round(span / step))
+        return [k * step for k in range(-n, n + 1) if k]
+
+    walkers = {}
+
+    def walker(it, wi, li):
+        key = (id(it), wi, li)
+        if key not in walkers:
+            walkers[key] = _walker(_lines(it["geoms"][wi])[li])
+        return walkers[key]
+
+    # per way: the current best (V, line, t) from its samples
+    state = []                         # (item, way index, [V, li, t])
+    for it, vals in zip(items, vals_by_item):
+        if it["kind"] not in ("line", "shore"):
+            continue
+        it["refined"] = [None] * len(it["members"])
+        k = 0
+        for wi, n in enumerate(it["way_counts"]):
+            idx = list(range(k, k + n))
+            k += n
+            if not idx:
+                continue
+            idx.sort(key=lambda i: -vals[i])
+            seeds = [(vals[i], *it["sample_pos"][i]) for i in idx[:REFINE_TOP]]
+            state.append((it, wi, seeds))
+
+    def run(stage_seeds):
+        """Score candidates around each way's seeds; keep the best per way."""
+        cands, owner = [], []
+        for si, (it, wi, seeds) in enumerate(stage_seeds):
+            for _v, li, t in seeds:
+                length, at = walker(it, wi, li)
+                for dt in stage_offsets:
+                    tt = t + dt
+                    if at.closed:                # round a shoreline, past its start
+                        tt %= length
+                    if 0.0 <= tt <= length:
+                        cands.append(at(tt))
+                        owner.append((si, li, tt))
+        scored = score_points(slug, cands) if cands else []
+        best = [max(seeds, key=lambda s: s[0]) for _it, _wi, seeds in stage_seeds]
+        for (si, li, tt), v in zip(owner, scored):
+            if v is not None and v > best[si][0]:
+                best[si] = (v, li, tt)
+        return best
+
+    stage_offsets = offsets(REFINE_SPAN_M, REFINE_STEP_M)
+    coarse = run(state)
+    stage_offsets = offsets(REFINE_FINE_M, 1.0)
+    fine = run([(it, wi, [b]) for (it, wi, _s), b in zip(state, coarse)])
+    for (it, wi, _s), (v, li, t) in zip(state, fine):
+        lat, lon = walker(it, wi, li)[1](t)
+        it["refined"][wi] = {"lat": lat, "lon": lon, "V": v}
+
+
+def score_items(slug: str, items: list[dict], progress=None) -> list[dict]:
+    """Score built items and return their records: the samples in one batch,
+    then the best-point refinement for every line in two more."""
+    t0 = time.time()
+    pts = [p for it in items for p in it["points"]]
+    vals = score_points(slug, pts, progress)
+    by_item, k = [], 0
+    for it in items:
+        by_item.append(vals[k:k + len(it["points"])])
+        k += len(it["points"])
+    refine_bests(slug, items, by_item)
+    per = (time.time() - t0) / max(1, len(pts))
+    return [finish_record(it, v, per * len(v)) for it, v in zip(items, by_item)]
 
 
 def way_stats(members: list[str], counts: list[int], samples: list) -> dict:
@@ -521,8 +766,8 @@ def add_way_stats(slug: str) -> dict:
 
 def plan(slug: str, core_only: bool = True) -> list[tuple[str, str]]:
     """Every scorable item in the AOI as (theme, fid): peaks and passes inside
-    the core box, and every trail with at least one way inside it, once per
-    trail rather than once per way."""
+    the core box, every lake touching it, and every trail with at least one
+    way inside it, once per trail rather than once per way."""
     from shapely.geometry import box, shape
     aoi = json.loads((ROOT / "data" / "aoi" / f"{slug}.json").read_text("utf-8"))
     c = aoi["core"]
@@ -535,6 +780,12 @@ def plan(slug: str, core_only: bool = True) -> list[tuple[str, str]]:
                 continue
             if not core_only or core.contains(shape(f["geometry"])):
                 out.append((theme, fid))
+    _raw_feature(slug, "water_areas", "")
+    for fid, f in _raw_cache[(slug, "water_areas")].items():
+        if core_only and not core.intersects(shape(f["geometry"])):
+            continue
+        if lake_area(f) is not None:
+            out.append(("water_areas", fid))
     _raw_feature(slug, "trails", "")
     seen = set()
     for fid, f in _raw_cache[(slug, "trails")].items():
@@ -660,9 +911,8 @@ def _run(job: dict, slug: str, theme: str, fid: str) -> None:
 
         def progress(done, total):
             job["done"] = done
-        vals = score_points(slug, item["points"], progress)
+        rec = score_items(slug, [item], progress)[0]
         job["done"] = job["total"]
-        rec = finish_record(item, vals, time.time() - t0)
         save_many(slug, [rec])
         job["record"] = _summary(rec)
         job["state"] = "done"

@@ -25,7 +25,7 @@ photographs or image models are involved.
 | Combining `V` with ruggedness `R` into one score | 🔜 designed, not built |
 | Canopy occlusion in `V` (trees block sightlines) | ✅ working |
 | Built-up gating of candidate points | 🔜 layer exists, gate not applied |
-| Scoring every trail, peak and pass, ranked in the viewer | ✅ working (one AOI, GPU) |
+| Scoring every trail, peak, pass and lake, ranked in the viewer | ✅ working (one AOI, GPU) |
 | More AOIs: Alps, Scandinavia, Pyrenees | 🔜 sources chosen, nothing pulled |
 
 The viewer came first because terrain data is hard to trust sight-unseen:
@@ -58,7 +58,7 @@ python scripts/serve.py
 ```
 
 `score_all.py` runs on the GPU if CuPy is installed
-(`python -m pip install "cupy-cuda12x[ctk]"`, NVIDIA only): about 1.5 minutes
+(`python -m pip install "cupy-cuda12x[ctk]"`, NVIDIA only): about 5 minutes
 for this AOI on an RTX 4080 SUPER. Without it, it falls back to every CPU
 core, which takes hours.
 
@@ -89,12 +89,13 @@ A point's score combines two terms:
 **View score `V`**, a solid-angle integral over the visible panorama:
 
 ```
-V = Σ  ΔΩ · c(class) · w(d) · d^γ
+V = Σ  ΔΩ · c(class) · w(d) · T · u(φ) · d^γ
 ```
 
 computed by marching the DEM outward along 720 azimuths, tracking the running
-maximum elevation angle. `γ ≈ 1` blends "how much of my visual field is filled"
-against "how much of the world can I see"; it is the main tuning knob.
+maximum elevation angle. `γ` blends "how much of my visual field is filled"
+against "how much of the world can I see" (0.5 as built), `T` lets trees
+block the view, and `u(φ)` weights terrain rising above eye level.
 
 **Ruggedness `R`**, variety in the local slope vector, in degrees: the RMS
 deviation of a plane-fitted gradient over a 240 m baseline, taken within a
@@ -159,8 +160,8 @@ or a line with no free spot, fall back to following the cursor.
 A trail that OSM splits into several ways is highlighted whole, all of it
 drawn the same, and the card gives both lengths in one row: this segment of
 the whole trail, with its segment count. Once a trail has a view score,
-hovering it also marks its best point, the sample with the highest V, with a
-white dot labelled with just that V. A multi-segment trail gets one such dot
+hovering it also marks its best point, the highest-V point found on the path
+(see "Trails, peaks, passes and lakes"), with a white dot labelled with just that V. A multi-segment trail gets one such dot
 at every segment's best point, the trail's best among them; where two labels
 would collide the lower one moves to another side of its dot, or is left off. The card gives the trail's average V and,
 on a multi-segment trail, the hovered segment's. Per-segment
@@ -370,7 +371,7 @@ does so with the curvature term in place.
 [docs/visibility-metric.md](docs/visibility-metric.md) for a single point:
 
 ```
-V = Σ ΔΩ · c(class) · w(d) · T · d^γ    (d in km, so V is in sr·km)
+V = Σ ΔΩ · c(class) · w(d) · T · u(φ) · d^γ    (d in km, so V is in sr·km^γ)
 ```
 
 One march per azimuth, 720 of them, in 30 m steps out to 150 km or the DEM's
@@ -392,28 +393,76 @@ in forest "sees" the walls above it straight through the trees: the first
 version of V did exactly that, and put the best point of Snow Lakes Trail
 under 89% canopy at the mouth of Snow Creek's canyon instead of in the
 Enchantments. `T` puts the trees back as occluders. A sightline counts as
-inside the canopy wherever it runs less than 30 m above ground of WorldCover's
-tree class, within 600 m of the observer, and is attenuated as
-`exp(−metres inside / 40 m)`. Looking up a wall from the forest floor leaves
+inside the canopy wherever it runs less than 30 m above forest, within 600 m
+of the observer, and is attenuated as `exp(−metres inside / 40 m)`. How much
+forest a 30 m cell holds is the share of its nine 10 m WorldCover pixels in
+the tree class, and the path through it counts in that proportion. (Reading
+one pixel per cell, as resampling to the DEM grid does, gave the same forest
+on average but flipped cells between forest and open every 10 m; on
+lakeshores with trees at their back the worst tenth of points swung 20%
+over a 15 m step, 17% with the share.) Looking up a wall from the forest floor leaves
 the canopy after some tens of metres, so you get glimpses; looking across the
 forest, you see nothing; across a lake or meadow the sightline is clear. It is
-per ray: from Colchuck Lake's east shore, V keeps 81% of its no-tree value,
+per ray: from Colchuck Lake's east shore, V keeps 80% of its no-tree value,
 and 100 m back into the trees at the north end only 11%. The panel shows `T`
 as the canopy factor, with V as it would be without trees.
 
+**Near terrain and terrain above you count for more.** The first versions
+used the doc's `γ = 1` and a 300 m near cutoff, and every lake basin scored a
+few percent of a summit. Two reasons, both general. At `γ = 1` a visible
+wall is worth roughly its height times the angle it spans *whatever its
+distance*, so a 300 m wall rising 45° over a lakeshore counted the same as a
+300 m hill 10 km away rising under 2°. And the walls of a small cirque lake
+rise from the shore, well inside 300 m, where V counted nothing. Now:
+
+- **`γ = 0.5`**, so how large terrain looks counts, while distant ranges
+  still matter. The doc's case against low `γ` was enclosure: a forest
+  clearing ringed by trees would win. With a bare-earth DEM and trees as
+  occluders that cannot happen.
+- **Near cutoff 90 m**, three DEM cells: enough to skip the ground underfoot,
+  not enough to throw away a cirque.
+- **Looming, `u(φ)`**: terrain seen above eye level counts up to 3×, rising
+  linearly from the horizontal to full weight at 20° (the band's mid angle).
+  Ground below the horizontal keeps weight 1, so a summit is not penalised.
+  The doc proposed this as a refinement.
+
+These were checked against a reference set: points 12 m outside the
+shorelines of 22 named lakes (each lake's best), six summits, and valley,
+forest and canyon points, plus 240 random points nobody picked. The median
+lake went from 5% of the median summit to 39%, valleys and forest stay under
+10%, and the random points' top scorers are open alpine terrain (mean canopy
+22% against 81% overall), the same kind of place as before. No place is
+treated specially: the reference set only says whether a general rule works.
+
 | parameter | value | source |
 |---|---|---|
-| `γ` | 1.0 | the doc's starting value; tune within 0.8–1.3 |
-| `w(d)` near cutoff | 300 m | the doc |
+| `γ` | 0.5 | see above; the doc started at 1.0 |
+| `w(d)` near cutoff | 90 m | three DEM cells; the doc had 300 m |
+| `u(φ)` looming | ×(1 + 2·clip(φ / 20°, 0, 1)) | the doc's proposed refinement; gain and angle are judgement |
 | `w(d)` haze taper | `exp(−d / 60 km)` | the doc; independent of the panorama's haze slider |
-| eye height | 2 m | fixed, so scores compare between points; the panel adds V at the slider's height as a comparison |
+| eye height | 2 m | fixed, so scores compare between points; the panel adds V at the slider's height as a comparison. A raised "survey" eye for terrain occlusion was tested and not adopted, see below |
 | `c` snow and ice, bare / sparse, water | 1.0 | the doc's "high" group |
 | `c` moss and lichen | 0.8 | "medium-high" |
 | `c` grassland, shrubland, wetland | 0.6 | "medium" |
 | `c` tree cover, cropland | 0.3 | "low" |
 | `c` built-up | −0.5 | "negative" |
 | `T` canopy height, mean free path, reach | 30 m, 40 m, 600 m | judgement: a Cascade conifer stand, and how far you see into one at eye level |
+| `T` forest per cell | share of the 3 × 3 10 m tree pixels | all of WorldCover's data, not one pixel per 30 m cell |
 | rays × step | 720 × 30 m | by convergence, below |
+
+**Eye height was tested, and 2 m stays.** The worry was that the 30 m DEM,
+interpolated into large flat facets, hides more from a 2 m eye than real
+ground would, making V jumpy. Terrain occlusion was computed from 2 to 8 m
+(the canopy test kept at the standing eye, so raising it could not see over
+trees) for 240 random points and 264 lakeshore points, each with six
+neighbours 15 m away. The swing of V across those 15 m barely moved: median
+7.1% at 2 m, 6.6% at 6 m (lakeshores 9.8% to 9.1%), while V rose 6-12%.
+With trees made transparent the swing is only 2.7% at 2 m: most of it is the
+canopy, not coarse terrain. Part of that was sampling, one 10 m pixel per
+30 m cell, which the forest share above fixed (median 7.1% to 7.0%, the
+worst tenth of lakeshores 20% to 17%); the rest is real, since 15 m at a
+forest edge does change how much forest stands between you and the view.
+The lift stays in the code (`vscore.TERRAIN_LIFT_M`) at 0.
 
 Ray count barely matters. Against a 2880-ray, 15 m-step reference at four
 test points, 360 rays land within 1.2% and 720 within 0.6%. Halving the step
@@ -430,13 +479,14 @@ anywhere else, a second line under it gives V for the same spot at the slider's
 height and the change against 2 m, to show how much a viewpoint gains from
 height. It is fetched after the 2 m score lands, recomputed 0.5 s after the
 slider stops, and never replaces the real score. From Colchuck Lake's east
-shore, for example, 205 m of height more than triples V (0.62 → 2.06); from
-Stuart's summit, where nothing nearby blocks the view, 200 m adds 35%.
+shore, for example, 205 m of height more than doubles V (1.50 → 3.67); from
+Stuart's summit, where nothing nearby blocks the view, 200 m adds 58%.
 
 The panel shows:
 
 - **The terms, summarised:** visible solid angle, its median distance, `dᵞ`
-  there, the mean `c`, the haze factor, and the same sum at `γ = 0`
+  there, the mean `c`, the haze, canopy and looming factors (each with V as it
+  would be without it), and the same sum at `γ = 0`
   (dominance, sr) and `γ = 2` (extent, km²), the doc's two axes, and the
   canopy factor `T` with V as it would be without trees.
 - **V and solid angle by distance band and by land-cover class.**
@@ -451,9 +501,9 @@ Bands the DEM edge cuts short are starred; their V is a lower bound. From the
 middle of this AOI that only affects the 60–150 km bands, which carry ~6% of a
 summit's score.
 
-### Trails, peaks and passes
+### Trails, peaks, passes and lakes
 
-Hover a trail, peak or pass on the map and press **V** to score it. The
+Hover a trail, peak, pass or lake on the map and press **V** to score it. The
 result goes into the feature's hover card and is stored, so it is shown again
 on later hovers without recomputing, across reloads
 (`scripts/featurescore.py`, `data/derived/<aoi>/feature_scores.json`).
@@ -466,10 +516,40 @@ on later hovers without recomputing, across reloads
   every 50 m along it, at the middle of each 50 m piece, using the full raw
   geometry. The card shows the average, the range along the trail, and how
   many points and OSM ways it covers. Unnamed ways are scored on their own.
-- **Peaks** are scored at their summit: the OSM node snapped to the highest
-  summit within 150 m, as the panorama does. Mount Stuart's node sits 24 m
-  down its flank; at the summit it scores 8.44.
+- **A trail's best point is searched for, not just sampled.** V can change a
+  lot within 50 m (one step onto a shoulder opens a view), so around each
+  way's two best samples the path itself is scored every 5 m out to 25 m
+  either side, then every metre out to 4 m around the winner. The search
+  stays on the trail's geometry. It found a better point than the best sample
+  on 90% of trails: median +5%, a tenth of them +29% or more. The average
+  still comes from the 50 m samples.
+- **Peaks** are scored on their own summit: from the OSM node, climb the DEM
+  cell by cell, always to the highest of the eight neighbours, until no
+  neighbour is higher, and stand at that cell's centre, the top of the
+  surface the score samples. Mount Stuart's node sits 24 m down its flank.
+  This replaced "the highest summit within 150 m" (the panorama's click
+  snap), which put 27 peaks on a different, higher summit nearby: Guye Peak
+  North and Middle both landed on one point. If the climb runs past 150 m
+  (44 peaks, mostly pinnacles the 30 m DEM cannot resolve, on slopes rising
+  into another mountain) the node is scored where it is: slightly low rather
+  than the wrong mountain.
 - **Passes** are scored at the node. Snapping would climb out of the saddle.
+- **Lakes** are scored along their shoreline, the way a trail is along its
+  path: a point every 50 m around each outer ring (islands are left out),
+  averaged, and the same along-the-path search for the best point, wrapping
+  around the closed ring. Standing on the shoreline itself, the view over the
+  water is open and the forest behind is occluded as usual. Only closed,
+  standing fresh water of at least 0.5 ha counts: OSM `natural=water` with
+  `water` lake, pond, reservoir or untagged, and not salt or tidal. That
+  leaves out the sea (OSM's `natural=coastline`), bays, rivers, stormwater
+  basins and the like, and ponds; 0.5 ha (about 80 m across) still keeps the
+  small named alpine lakes (Divide Lake, Little Caroline Lake, Upper Florence
+  Lake are all just under 1 ha). The OSM download returns whole features, so a
+  lake crossing its edge is still complete (Lake Chelan reaches Stehekin).
+  `process.py` marks qualifying lakes in the tiles (`lake`, `area`), so the
+  viewer offers V only on those. The card shows the lake's area and its
+  average V along the shore; its best point is marked on hover like a
+  trail's.
 
 Each point costs ~1.5 s on one CPU core. A pool of 8 worker processes brings
 that to ~240 ms (more workers did not help: the march is limited by memory
@@ -478,15 +558,16 @@ one CUDA thread per ray walks the same march, and a second kernel computes
 the ray geometry itself (Vincenty's direct geodesic, then the DEM's Albers
 projection), because preparing it with pyproj on the CPU cost 25-30 ms a
 point against 0.5 ms for the march. Checked against the CPU: ray positions
-agree to 1.5 cm and V to 0.27% at worst (0.02% on average; the canopy test
+agree to 1.5 cm and V to 0.19% at worst (0.03% on average; the canopy test
 is a threshold, and float32 tips the odd sample across it). The V key uses the GPU when there
 is one, so even a long trail scores in about a second.
 
 ### Scoring everything, and the ranked list
 
-`scripts/score_all.py` scores every peak and pass inside the core box and
-every trail with a way inside it: 6,534 items, 107,624 trail samples at 50 m,
-in about 2.5 minutes on the GPU. It skips anything already stored under the
+`scripts/score_all.py` scores every peak and pass inside the core box, every
+lake touching it and every trail with a way inside it: 7,030 items (496 of
+them lakes), 120,690 samples at 50 m plus the best-point search, in about 4
+minutes on the GPU. It skips anything already stored under the
 current version, so it resumes after an interruption, and writes the store
 and a status file after each chunk.
 
@@ -497,43 +578,49 @@ GPU the exhaustive run costs a couple of minutes, so they would save seconds
 while risking exactly the scenic stretches a ranking exists to find. Without
 a GPU (hours of CPU) they would be worth revisiting.
 
-The **ranked list** on the right shows every scored trail, peak or pass, and
-sorts by any column: V (the average along a trail), best V (its highest
-sample), length, minimum and maximum elevation, and elevation gain.
+The **ranked list** on the right shows every scored trail, peak, pass or
+lake, and sorts by any column: V (the average along a trail or shoreline),
+best V (its highest point), length (a lake's shoreline), minimum and maximum
+elevation, and elevation gain; the Lakes tab shows each lake's area instead
+of gain, and its surface elevation as Max.
 Elevation is sampled from the DEM every 10 m; gain counts a rise only once
 the profile has climbed 5 m from its last turning point, so DEM ripple adds
 nothing, and takes each segment in its more uphill direction, since a
 branching trail has no single direction. Peaks and passes show their OSM
 elevation (the DEM at a summit is typically ~10 m low, up to ~25 m, as a
 30 m grid rounds off sharp tops). Selecting a row zooms the map to the item, switches its layer on
-if needed, and marks it. While a bulk job runs, the list shows its progress
-and fills in as chunks land.
+if needed, and marks it (a lake gets an outline). While a bulk job runs, the
+list shows its progress and fills in as chunks land.
+
+The lake ranking is led by the high cirque lakes under the glaciated peaks
+around Mount Daniel and Mount Hinman: Venus Lake (1.92 along the shore, best
+2.63), Hinman Lake, Chain Lakes, Jack Lake, Iceberg Lake, Chair Peak Lake.
+Colchuck Lake averages 1.14 but is seventh by best point (1.94, its south end
+under Dragontail). Forested lakes such as Mig and Hope Lake near Stevens Pass
+come last.
 
 Trails default to 1 km and up. Averaged V favours the very short: a 10 m spur
 on a summit or a 100 m bootpath averages higher than any real trail, and
 without a floor those fill the top of the list. From 1 km up, the top of the
-list is open summit and ridge routes: the Mount Daniel climbers' trail, Iron
-Peak, Mount Hinman's west ridge, Little Annapurna. Sorting by best V instead
-surfaces trails with one standout point and an ordinary average: Kaleetan
-Peak Climbers Trail is 27th by average (0.47) but seventh by best V (2.80),
-and Baring Mountain Trail goes from 34th to third (best 3.90).
+list mixes summit routes and lake basins: Aasgard Pass Trail (Colchuck Lake
+up into the Upper Enchantments), Venus Lake, Dragontail, Little Annapurna,
+Circle Lake, the Mount Daniel climbers' trail, Chain Lakes. Sorting by best V
+instead surfaces trails with one standout point and an ordinary average:
+Colchuck Lake Trail is 30th by average (0.41) but fourth by best V (1.91, at
+the lake), and Baring Mountain Trail goes from 59th to tenth (best 1.64).
 
-Canopy occlusion moved this list a lot. Before it, Tumwater Mountain Trail, a
-forested ridge above Leavenworth, was first by average (2.33); it is now 26th
-(0.48). Snow Lakes Trail's best point moved from the canyon mouth (1.17 then,
-0.35 now) to the Upper Enchantments at 2,276 m (0.92), and the forested
-middle of the trail, km 3 to 13, scores close to nothing. What it did not
-change: an enclosed basin still scores well below a summit. The Enchantments
-and Colchuck Lake's shore reach 0.4–0.9, against 5–8 on the summits above
-them, because at `γ = 1` a wall is worth roughly its visible height times
-the angle it spans, so a summit looking down 2 km on every side outscores a
-basin ringed by 400 m walls. Whether that should change (a lower `γ`, or a
-term for the alpine setting you stand in) is for the reference set to decide.
+Two rule changes moved this list a lot. Canopy occlusion took Tumwater
+Mountain Trail, a forested ridge above Leavenworth, from first by average to
+105th, and moved Snow Lakes Trail's best point from under 89% canopy at the
+mouth of Snow Creek's canyon into the Upper Enchantments. Then `γ = 0.5`, the
+90 m cutoff and looming lifted basins against summits: Snow Lakes Trail went
+from 114th to 24th by average, its Enchantments section scoring 1.0–1.3
+against 0.1–0.8 in the canyon, while summits still lead (Mount Stuart 3.20).
 
 **Stored scores are versioned.** Each carries `vscore.version_tag()`, a
 hand-bumped `ALGORITHM_VERSION` plus a hash of every parameter that affects V
 (γ, haze, cutoff, range, eye height, rays, step, class weights, canopy,
-refraction),
+looming, refraction),
 and `featurescore.version()` adds the sampling parameters. The server ignores
 any stored score whose tag differs, so changing a constant invalidates old
 scores automatically; bump `ALGORITHM_VERSION` for changes to the method that
@@ -541,24 +628,22 @@ move no constant.
 
 First readings, all at the snapped viewpoint:
 
-| viewpoint | V | dominance | extent | median distance | V from ≤ 3 km | top class | canopy T |
-|---|---|---|---|---|---|---|---|
-| Mount Stuart summit | **7.97** | 1.59 sr | 133 km² | 3.6 km | 15% | tree cover 35% | 0.94 |
-| Dragontail Peak summit | **4.81** | 1.26 sr | 89 km² | 2.5 km | 19% | bare / sparse 29% | 1.00 |
-| Colchuck Lake east shore | **0.62** | 0.57 sr | 0.9 km² | 1.0 km | 95% | bare / sparse 67% | 0.81 |
-| Icicle Creek valley floor | **0.14** | 0.02 sr | 3 km² | 1.0 km | 6% | tree cover 60% | 0.16 |
-| Snoqualmie Pass | **0.15** | 0.09 sr | 1 km² | 1.5 km | 63% | tree cover 74% | 0.27 |
+| viewpoint | V | dominance | extent | median distance | V from ≤ 3 km | top class | canopy T | looming u |
+|---|---|---|---|---|---|---|---|---|
+| Mount Stuart summit | **3.20** | 1.90 sr | 132 km² | 3.2 km | 33% | bare / sparse 39% | 0.90 | 1.00 |
+| Dragontail Peak summit | **2.05** | 1.32 sr | 90 km² | 2.0 km | 43% | bare / sparse 42% | 1.00 | 1.00 |
+| Colchuck Lake east shore | **1.50** | 1.78 sr | 2 km² | 0.8 km | 98% | bare / sparse 65% | 0.80 | 2.19 |
+| Icicle Creek valley floor | **0.05** | 0.05 sr | 3 km² | 0.1 km | 42% | tree cover 72% | 0.12 | 1.10 |
+| Snoqualmie Pass | **0.15** | 0.14 sr | 1 km² | 0.5 km | 85% | tree cover 60% | 0.20 | 1.64 |
 
-The last column is the canopy factor `T`. The order is the intuitive one. Two
-things to note before reading the numbers as calibrated:
+The order is the intuitive one. Two things to note before reading the numbers
+as calibrated:
 
-- **Forest seen from above still earns a lot.** At `c = 0.3`, tree cover is
-  the largest single contributor from Stuart, because the valleys 3–10 km
-  below it are forested and fill a lot of solid angle. That is the class
-  weights working as specified (canopy occlusion is about trees between you
-  and the view, not trees *in* it), but it is the first thing the reference
-  set should test.
-- **V is raw, in sr·km.** The doc normalises it to its median over a
+- **Forest seen from above still earns something.** At `c = 0.3`, the
+  forested valleys 3–10 km below a summit fill a lot of solid angle. That is
+  the class weights working as specified (canopy occlusion is about trees
+  between you and the view, not trees *in* it).
+- **V is raw, in sr·km^γ.** The doc normalises it to its median over a
   reference region before combining with `R`; there is no reference region
   yet.
 
@@ -991,8 +1076,10 @@ missing.
   across the map, and only inside the core box. A full raster of V (a score
   for every 30 m cell) would be ~170 million points: about two days on this
   GPU, so it would want the doc's `R` pre-filter and built-up gate.
-- **`V` is uncalibrated.** There is no reference set of known-epic and
-  known-dull points to fit `γ` and `c` against, and no median to normalise by.
+- **`V` is only loosely calibrated.** `γ`, the cutoff and the looming weight
+  were checked against a small reference set (lakeshores, summits, valleys,
+  random points; see View score), not fitted to it, and there is no median
+  to normalise by.
   The doc ranks glaciers above snow and ice, but there is no glacier raster
   (RGI needs a login; OSM glaciers are vectors), so WorldCover's snow-and-ice
   class stands in for both.

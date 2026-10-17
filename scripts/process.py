@@ -820,7 +820,16 @@ def build_vector_lod(slug: str, out_dir: Path,
         # grouping is featurescore's own, so the highlight is exactly what V
         # scores. Lengths are geodesic, from the raw geometry, so the
         # simplified tiers report the same numbers as the full one.
-        trail_info = {}
+        extra_info = {}
+        if theme == "water_areas":
+            # lakes big enough to score carry their area, so the viewer only
+            # offers V on what featurescore will accept
+            import featurescore
+            for f in feats:
+                if f.get("id"):
+                    a = featurescore.lake_area(f)
+                    if a is not None:
+                        extra_info[f["id"]] = {"lake": 1, "area": round(a)}
         if theme == "trails":
             import featurescore
             from pyproj import Geod
@@ -835,7 +844,7 @@ def build_vector_lod(slug: str, out_dir: Path,
                     info["trail"] = featurescore.group_key(members)
                     info["trail_len"] = round(sum(seg.get(x, 0.0) for x in members))
                     info["trail_n"] = len(members)
-                trail_info[wid] = info
+                extra_info[wid] = info
 
         entries = []
         for tier, tol in tiers:
@@ -882,7 +891,7 @@ def build_vector_lod(slug: str, out_dir: Path,
                     feat["id"] = f["id"]
                     # GeoJSON foreign members, so they stay out of the tag
                     # table the Alt-click popup shows
-                    feat.update(trail_info.get(f["id"], {}))
+                    feat.update(extra_info.get(f["id"], {}))
                 out_feats.append(feat)
 
             def dump(features):

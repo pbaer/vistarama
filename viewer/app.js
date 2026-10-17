@@ -566,7 +566,18 @@ let hovered = null;               // { layer, base, theme }
 // scores are loaded once at start-up and shown in the hover card from then
 // on, across reloads. The server drops any score computed under another
 // version of the method, so what arrives here is always current.
-const SCORABLE_THEMES = new Set(['trails', 'peaks', 'passes']);
+const SCORABLE_THEMES = new Set(['trails', 'peaks', 'passes', 'water_areas']);
+
+/** Whether a hovered feature can be scored. Water areas only when the tiles
+ *  mark them as a lake (featurescore.lake_area: standing fresh water of at
+ *  least 0.5 ha), so ponds, rivers and basins do not offer V. */
+function isScorable(theme, feature) {
+  if (!SCORABLE_THEMES.has(theme) || !feature || !feature.id) return false;
+  return theme !== 'water_areas' || !!feature.lake;
+}
+
+/** Records scored along a path: a trail, or a lake's shoreline. */
+const isPathRecord = (r) => r && (r.kind === 'line' || r.kind === 'shore');
 const FS_POLL_MS = 500;
 const featureScores = new Map();   // OSM id -> stored score summary
 const featureJobs = new Map();     // OSM id -> { state, done, total, error }
@@ -626,7 +637,7 @@ function bestPoints(rec) {
 function showBestPoint(feature) {
   hideBestPoint();
   const rec = feature && feature.id && featureScores.get(feature.id);
-  if (!rec || rec.kind !== 'line' || !rec.best) return;
+  if (!isPathRecord(rec) || !rec.best) return;
   bestPoint = [];
   const placed = [];
   for (const p of bestPoints(rec)) {
@@ -697,7 +708,9 @@ function scoreRows(fid) {
   const rec = featureScores.get(fid);
   const job = featureJobs.get(fid);
   if (rec) {
-    if (rec.kind === 'line') {
+    if (rec.kind === 'shore') {
+      rows.push(['View score', `${vsFmt(rec.V)} avg along the shore`, true]);
+    } else if (rec.kind === 'line') {
       // the trail's average, and on a multi-way trail the hovered way's own;
       // the best points are marked on the map, so they are not repeated here
       const seg = rec.n_ways > 1 && rec.way_stats && rec.way_stats[fid];
@@ -733,7 +746,8 @@ document.addEventListener('keydown', (ev) => {
   if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
   const t = ev.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-  if (!hovered || !SCORABLE_THEMES.has(hovered.theme) || $('hovercard').hidden) return;
+  if (!hovered || !isScorable(hovered.theme, hovered.layer.feature)
+      || $('hovercard').hidden) return;
   const fid = hovered.layer.feature && hovered.layer.feature.id;
   if (!fid) return;
   ev.preventDefault();
@@ -838,6 +852,7 @@ function renderHoverCard(theme, feature) {
   card.append(head, sub);
   const facts = hoverFacts(theme, props);
   if (theme === 'trails') facts.push(...trailLengthRows(feature));
+  if (theme === 'water_areas' && feature && feature.area) facts.push(['Area', formatArea(feature.area)]);
   for (const [k, v] of facts) {
     const row = el('div', 'hc-row');
     const kk = el('span', 'k');
@@ -847,7 +862,7 @@ function renderHoverCard(theme, feature) {
     row.append(kk, vv);
     card.appendChild(row);
   }
-  const scorable = SCORABLE_THEMES.has(theme) && fid;
+  const scorable = isScorable(theme, feature);
   if (scorable) {
     scoreRows(fid).forEach(([k, v, main], i) => {
       const row = el('div', `hc-row hc-score${i === 0 ? ' first' : ''}`);
@@ -864,6 +879,12 @@ function renderHoverCard(theme, feature) {
     ? 'V: view score · Alt-click for all tags' : 'Alt-click for all tags';
   card.appendChild(foot);
   card.hidden = false;
+}
+
+/** A surface area in m², as hectares or km². */
+function formatArea(m2) {
+  return m2 >= 1e6 ? `${(m2 / 1e6).toFixed(m2 >= 1e7 ? 0 : 1)} km²`
+    : `${(m2 / 1e4).toFixed(m2 >= 1e5 ? 0 : 1)} ha`;
 }
 
 /** Keep the card beside the pointer, flipping to the other side near the
@@ -1102,7 +1123,7 @@ function hoverStart(theme, layer, ev) {
     }
   }
   renderHoverCard(theme, layer.feature);
-  if (theme === 'trails') showBestPoint(layer.feature);
+  if (theme === 'trails' || theme === 'water_areas') showBestPoint(layer.feature);
   hovered.follow = !placeHoverCardFor(layer, theme);
   if (hovered.follow && ev && ev.originalEvent) {
     placeHoverCard(ev.originalEvent.clientX, ev.originalEvent.clientY);
@@ -1157,8 +1178,9 @@ function makeGeoJsonLayer(theme, data) {
       lyr.on('mouseout', () => hoverEnd(lyr));
       // a chunk swapped out for another LOD tier never sends mouseout
       lyr.on('remove', () => hoverEnd(lyr));
-      // a selected trail in the ranked list stays marked as its tiles reload
-      if (theme === 'trails') lyr.on('add', () => markRankTrailLayer(lyr));
+      // a selected trail or lake in the ranked list stays marked as its
+      // tiles reload
+      if (theme === 'trails' || theme === 'water_areas') lyr.on('add', () => markRankLayer(lyr));
       if (f.trail) {
         lyr.on('add', () => {
           if (!trailLayers.has(f.trail)) trailLayers.set(f.trail, new Set());
@@ -2352,6 +2374,16 @@ function vsEyeLabel(eye) {
 }
 
 /** Draw the comparison line; `v` null means it is still being computed. */
+// V's units depend on γ (sr·km^γ), so they come from the server's result
+let vsUnits = 'sr·km';
+
+/** Write the units into `node`, with any exponent as a superscript. */
+function setUnits(node) {
+  const [base, exp] = vsUnits.split('^');
+  node.replaceChildren(document.createTextNode(base));
+  if (exp) node.appendChild(el('sup', null, exp));
+}
+
 function showAltScore(eye, v) {
   vsAltShown = { eye, v };
   const box = $('vs-alt');
@@ -2363,7 +2395,9 @@ function showAltScore(eye, v) {
   } else {
     const b = el('b');
     b.textContent = vsFmt(v);
-    val.append(b, document.createTextNode(' sr·km'));
+    const u = el('span');
+    setUnits(u);
+    val.append(b, document.createTextNode(' '), u);
     if (vsMainV) {
       const d = v / vsMainV - 1;
       const pct = el('small');
@@ -2463,7 +2497,9 @@ function renderViewScore(d) {
   const vis = d.visible, ax = d.axes, P = d.params;
   $('vscore').classList.remove('stale');
   vsMainV = d.V;
+  vsUnits = d.units || vsUnits;
   $('vs-value').textContent = vsFmt(d.V);
+  setUnits(document.querySelector('#vscore .vs-unit'));
   $('vs-state').textContent = `${d.elapsed_ms} ms`;
   const body = $('vs-body');
   body.replaceChildren();
@@ -2478,6 +2514,7 @@ function renderViewScore(d) {
     vsRow('Mean land-cover weight c', vis.mean_class_weight.toFixed(2)),
     vsRow('Haze factor w', `${vis.haze_factor.toFixed(2)} (V ${vsFmt(ax.v_no_haze)} without)`),
     vsRow('Canopy factor T', `${vis.canopy_factor.toFixed(2)} (V ${vsFmt(ax.v_no_canopy)} without trees)`),
+    vsRow('Looming factor u', `${vis.loom_factor.toFixed(2)} (V ${vsFmt(ax.v_no_loom)} without)`),
   );
   const s1b = el('div', 'vs-note');
   s1b.textContent = 'The same sum at the two extremes of γ:';
@@ -2568,6 +2605,8 @@ function renderViewScore(d) {
     vsRow('γ, distance exponent', String(P.gamma)),
     vsRow('w(d): near cutoff', `${P.near_cutoff_m} m`),
     vsRow('w(d): haze taper exp(−d / dₕ)', `dₕ = ${P.d_haze_km} km`),
+    vsRow('u(φ): looming, above eye level',
+      `up to ×${1 + P.loom_gain}, full at ${P.loom_full_deg}°`),
     vsRow('T: canopy exp(−path in trees / λ)',
       `λ = ${P.canopy_mfp_m} m, below ${P.canopy_h_m} m, first ${P.canopy_reach_m} m`),
     vsRow('Observer', `${d.ground_m} m ground + ${d.eye_m} m eye`),
@@ -2704,21 +2743,27 @@ const RANK_IDLE_POLL_MS = 15000;   // otherwise, to notice a job started later
 const RANK_COLS = [
   // key, header, title, value getter, formatter, numeric
   ['name', 'Name', 'Name', (r) => r.name || '', null, false],
-  ['V', 'V', 'View score: the average along a trail, or at a peak or pass',
+  ['V', 'V', 'View score: the average along a trail or a lake\'s shoreline, or at a peak or pass',
     (r) => r.V, (v) => v.toFixed(2), true],
-  ['V_max', 'Best', 'Highest V anywhere along the trail',
-    (r) => (r.kind === 'line' ? r.V_max : null), (v) => v.toFixed(2), true],
-  ['length_m', 'Length', 'Trail length (whole trail)',
-    (r) => (r.kind === 'line' ? r.length_m : null),
+  ['V_max', 'Best', 'Highest V anywhere along the trail or shoreline',
+    (r) => (isPathRecord(r) ? r.V_max : null), (v) => v.toFixed(2), true],
+  ['area_m2', 'Area', 'Lake surface area', (r) => (r.kind === 'shore' ? r.area_m2 : null),
+    formatArea, true, ['water_areas']],
+  ['length_m', 'Length', 'Trail length (whole trail), or a lake\'s shoreline',
+    (r) => (isPathRecord(r) ? r.length_m : null),
     (v) => (v >= 10000 ? `${(v / 1000).toFixed(0)} km` : `${(v / 1000).toFixed(1)} km`), true],
   ['ele_min_m', 'Min', 'Lowest elevation, m',
-    (r) => r.ele_min_m, (v) => Math.round(v).toLocaleString(), true],
-  ['ele_max_m', 'Max', 'Highest elevation, m (a peak or pass: its elevation)',
+    (r) => r.ele_min_m, (v) => Math.round(v).toLocaleString(), true,
+    ['trails', 'peaks', 'passes', 'all']],   // a lake has one elevation: Max
+  ['ele_max_m', 'Max', 'Highest elevation, m (a peak, pass or lake: its elevation)',
     (r) => r.ele_max_m, (v) => Math.round(v).toLocaleString(), true],
   ['gain_m', 'Gain', 'Elevation gain, m, each segment walked in its uphill direction',
-    (r) => (r.kind === 'line' ? r.gain_m : null), (v) => Math.round(v).toLocaleString(), true],
+    (r) => (r.kind === 'line' ? r.gain_m : null), (v) => Math.round(v).toLocaleString(), true,
+    ['trails', 'all']],
 ];
-const RANK_THEME_LABEL = { trails: 'trail', peaks: 'peak', passes: 'pass' };
+// A column with a 7th entry is shown only for those list types.
+const rankCols = () => RANK_COLS.filter((c) => !c[6] || c[6].includes(rankState.type));
+const RANK_THEME_LABEL = { trails: 'trail', peaks: 'peak', passes: 'pass', water_areas: 'lake' };
 
 const featureItems = new Map();    // record key -> stored summary
 // Trails default to 1 km and up. Averaged V favours the very short: a 10 m
@@ -2759,7 +2804,7 @@ function renderRank() {
   head.replaceChildren();
   const hr = el('tr');
   hr.appendChild(el('th', 'num', '#'));
-  for (const [key, label, title] of RANK_COLS) {
+  for (const [key, label, title] of rankCols()) {
     const th = el('th', key === 'name' ? 'name' : 'num');
     th.textContent = label + (rankState.sort === key ? (rankState.dir < 0 ? ' ▾' : ' ▴') : '');
     th.title = `${title}. Click to sort.`;
@@ -2786,7 +2831,7 @@ function renderRank() {
     const n = el('td', 'num rank-n');
     n.textContent = String(i + 1);
     tr.appendChild(n);
-    for (const [key, , , get, fmt] of RANK_COLS) {
+    for (const [key, , , get, fmt] of rankCols()) {
       const td = el('td', key === 'name' ? 'name' : 'num');
       if (key === 'name') {
         const sw = el('i', `rank-sw t-${r.theme}`);
@@ -2807,8 +2852,8 @@ function renderRank() {
   const more = $('rank-more');
   more.hidden = rows.length <= rankState.shown;
   more.textContent = `Show ${Math.min(RANK_PAGE, rows.length - rankState.shown)} more`;
-  const kind = rankState.type === 'all' ? 'items' : rankState.type;
-  const minLen = rankState.minLen && rankState.type !== 'peaks' && rankState.type !== 'passes'
+  const kind = { all: 'items', water_areas: 'lakes' }[rankState.type] || rankState.type;
+  const minLen = rankState.minLen && (rankState.type === 'trails' || rankState.type === 'all')
     ? `, trails ≥ ${rankState.minLen / 1000} km` : '';
   $('rank-count').textContent = `${rows.length.toLocaleString()} ${kind}`
     + (rankState.named ? ', named only' : '') + minLen;
@@ -2818,7 +2863,7 @@ function renderRank() {
 function clearRankSelection() {
   if (!rankSel) return;
   for (const l of rankSel.layers) {
-    if (map.hasLayer(l)) l.setStyle(styleFor('trails', l.feature.properties));
+    if (map.hasLayer(l)) l.setStyle(styleFor(rankSel.theme, l.feature.properties));
   }
   if (rankSel.marker) map.removeLayer(rankSel.marker);
   rankSel = null;
@@ -2827,13 +2872,18 @@ function clearRankSelection() {
 const RANK_SEL_STYLE = (w) => ({ color: SELECT_COLOR, weight: (w || 1) + 3,
   opacity: 1, dashArray: null });
 
-/** Mark a trail's layers as selected; called again as tiles load. */
-function markRankTrailLayer(lyr) {
-  if (!rankSel || rankSel.theme !== 'trails' || !lyr.feature) return;
+/** Mark a selected trail's or lake's layers; called again as tiles load. A
+ *  lake keeps its fill and gains the selection outline. */
+function markRankLayer(lyr) {
+  if (!rankSel || !lyr.feature) return;
   const f = lyr.feature;
-  if (f.trail !== rankSel.key && f.id !== rankSel.key) return;
+  if (rankSel.theme === 'trails') {
+    if (f.trail !== rankSel.key && f.id !== rankSel.key) return;
+  } else if (rankSel.theme !== 'water_areas' || f.id !== rankSel.key) {
+    return;
+  }
   if (!rankSel.layers.includes(lyr)) rankSel.layers.push(lyr);
-  lyr.setStyle(RANK_SEL_STYLE(styleFor('trails', f.properties).weight));
+  lyr.setStyle(RANK_SEL_STYLE(styleFor(rankSel.theme, f.properties).weight));
 }
 
 function selectRankItem(r) {
@@ -2846,10 +2896,10 @@ function selectRankItem(r) {
   // is actually visible: pad the fit by the panel's width on that side.
   const panelW = $('panel').classList.contains('hidden') ? 0 : $('panel').getBoundingClientRect().width;
   const fit = { paddingTopLeft: [panelW + 50, 50], paddingBottomRight: [50, 50] };
-  if (r.kind === 'line' && r.bbox) {
+  if (isPathRecord(r) && r.bbox) {
     const [w, s, e, n] = r.bbox;
     map.fitBounds([[s, w], [n, e]], { ...fit, maxZoom: 15 });
-    if (st) st.onMap.forEach((gj) => gj.eachLayer(markRankTrailLayer));
+    if (st) st.onMap.forEach((gj) => gj.eachLayer(markRankLayer));
   } else if (r.lat !== undefined) {
     const z = Math.max(map.getZoom(), 14);
     map.fitBounds(L.latLng(r.lat, r.lon).toBounds(1), { ...fit, maxZoom: z });

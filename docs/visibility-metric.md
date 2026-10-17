@@ -22,7 +22,12 @@ viewer's score panel. The README's "View score" section has the parameters as
 built (720 rays × 30 m, numeric class weights) and the first readings.
 
 As built, V also carries a canopy transmittance `T` that this part did not
-originally specify; see "Canopy occlusion" below.
+originally specify; see "Canopy occlusion" below. It also departs from the
+starting values here in three ways, after a reference set showed lake basins
+scoring a few percent of summits: `γ = 0.5` rather than 1, a 90 m near
+cutoff rather than 300 m, and the elevation-angle refinement under "Class
+weighting" built in as a looming weight. See "As built: nearness and
+looming" below.
 
 ---
 
@@ -242,6 +247,41 @@ terrain below it.
 
 ---
 
+## As built: nearness and looming
+
+The first scoring run used `γ = 1` and a 300 m near cutoff. Against a
+reference set — the best of 12 points just outside the shore of each of 22
+named lakes, six summits, valley, forest and canyon points, and 240 random
+points — lake basins came out at a median 5% of a summit. Two general causes:
+
+1. **At `γ = 1` distance cancels.** A wall of height `h` spanning `Δα` at
+   distance `d` subtends `ΔΩ ≈ Δα·h/d`; times `d` that is `Δα·h`, whatever
+   `d` is. A 300 m wall rising 45° over a lakeshore counts the same as a 300 m
+   hill 10 km off rising under 2°. Visual dominance, the reason basins are
+   dramatic, did not count at all.
+2. **The cutoff discarded cirques.** The walls of a small lake rise from its
+   shore, inside 300 m.
+
+The case for `γ = 1` in the worked comparison above was the enclosure
+failure at low `γ`: a forest clearing ringed by trees winning. That needed
+trees to count as terrain. On a bare-earth DEM with trees as occluders
+(below) they do not, so `γ` dropped to 0.5. The cutoff dropped to 90 m, three
+DEM cells, still clear of the cell underfoot. And the elevation-angle
+refinement proposed under "Class weighting" is built in:
+
+```
+u(φ) = 1 + 2 · clip(φ / 20°, 0, 1)      φ = the band's mid elevation angle
+```
+
+Terrain above eye level counts up to 3×; below the horizontal it keeps
+weight 1, so a summit's panorama is not penalised. With all three, the
+median lake is 39% of the median summit, valleys and forest stay under 10%,
+and the top random points are still open alpine terrain. The reference set
+is a check on whether a general rule behaves, never a target: nothing in V
+depends on where a point is.
+
+---
+
 ## Canopy occlusion
 
 Added after the first scoring run. The DEM is bare earth, so a viewpoint in
@@ -259,7 +299,9 @@ T = exp(−L / λ)
 where `L` is the length of the sightline, within the first 600 m, that runs
 less than `h_c` above ground of the tree class, with `h_c` = 30 m and the mean
 free path `λ` = 40 m. The test uses the band's top edge, the most open line to
-it. A sightline up a wall from the forest floor clears the canopy within tens
+it. "Tree class" is a share per 30 m DEM cell, the fraction of its nine
+10 m WorldCover pixels that are trees, and the path through a cell counts in
+that proportion; one pixel per cell aliased forest edges. A sightline up a wall from the forest floor clears the canopy within tens
 of metres and is dimmed, not lost; one across the forest is gone; one over a
 lake or meadow is untouched.
 
@@ -526,9 +568,10 @@ Keeping this list short is a design goal in itself.
 
 | Parameter | Role | Start at | Tune? |
 |---|---|---|---|
-| `γ` | extent vs dominance in `V` | 1.0 | **yes**, 0.8–1.3 |
+| `γ` | extent vs dominance in `V` | 1.0 (0.5 as built) | **yes** |
 | `d_haze` | atmospheric taper | 60 km | maybe, 50–80 km |
-| near cutoff | ignore the cell underfoot | 300 m | no |
+| near cutoff | ignore the cell underfoot | 300 m (90 m as built) | no |
+| `u(φ)` gain, full angle | looming: terrain above eye level | 2, 20° | maybe |
 | `h_c`, `λ` | canopy height, mean free path in forest | 30 m, 40 m | maybe |
 | `c(class)` | land-cover interest weights | table above | coarsely, ~4 groups |
 | `R_kernel` | ruggedness radius | 10 km | **yes**, 5–20 km |

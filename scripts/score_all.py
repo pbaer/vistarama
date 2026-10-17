@@ -95,13 +95,9 @@ def main() -> int:
         nonlocal done_items, done_points
         pts = [p for it in chunk_items for p in it["points"]]
         tc = time.time()
-        vals = fs.score_points(slug, pts)
+        # samples, then each trail's best point searched along its path
+        records = fs.score_items(slug, chunk_items)
         per = (time.time() - tc) / max(1, len(pts))
-        records, k = [], 0
-        for it in chunk_items:
-            n = len(it["points"])
-            records.append(fs.finish_record(it, vals[k:k + n], per * n))
-            k += n
         fs.save_many(slug, records)
         done_items += len(chunk_items)
         done_points += len(pts)

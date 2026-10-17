@@ -2,7 +2,7 @@
 
 Implements Part 1 of docs/visibility-metric.md:
 
-    V = sum over visible terrain of  dOmega * c(class) * w(d) * d_km^gamma
+    V = sum over visible terrain of  dOmega * c(class) * w(d) * T * u(phi) * d_km^gamma
 
 computed by one outward DEM march per azimuth. Along each ray the running
 maximum elevation angle is the horizon so far; whenever a sample rises above
@@ -18,6 +18,9 @@ surface normal.
   1 is the balanced starting point.
 * `w(d)` has two jobs only: ignore everything nearer than NEAR_CUTOFF_M, and
   taper with distance as exp(-d / D_HAZE_M).
+* `u(phi)` weights terrain by the elevation angle it is seen at: 1 at or
+  below eye level, rising to 1 + LOOM_GAIN at LOOM_FULL_DEG and above.
+  Walls rising over you read as more dramatic than ground spread below you.
 * `c(class)` weights the land cover *at the visible terrain*, not at the
   observer.
 * The DEM is bare earth, so trees are added back as occluders: a line of
@@ -54,13 +57,19 @@ import panorama
 # (how bands are credited, how rays end at the data edge, the sampling
 # geometry...). Stored scores carry this and a hash of every parameter, see
 # `version_tag`, and anything stored under another tag is recomputed.
-ALGORITHM_VERSION = 2
+ALGORITHM_VERSION = 3
 
 # ---- parameters (docs/visibility-metric.md, "Parameter inventory") ----------
 
-# Extent vs dominance. The doc's worked comparison ranks col > summit ~ distant
-# range > cirque >> clearing > plain at 1.0, and says to tune within 0.8-1.3.
-GAMMA = 1.0
+# Extent vs dominance. The doc started at 1.0, where a visible wall is worth
+# roughly its height times the angle it spans *whatever its distance*: a
+# 300 m wall rising 45 deg over a lakeshore scored the same as a 300 m hill
+# 10 km off rising under 2 deg, and every basin scored a few percent of a
+# summit. The doc's case against lower values was enclosure, a forest
+# clearing ringed by trees winning; with a bare-earth DEM and trees as
+# occluders (CANOPY_*) that case cannot arise. 0.5 lets nearness count while
+# distant ranges still matter.
+GAMMA = 0.5
 
 # Atmospheric taper. 60 km is the doc's starting value (50-80 km range). This
 # is the score's own constant, deliberately independent of the panorama's haze
@@ -70,8 +79,18 @@ D_HAZE_M = 60_000.0
 
 # Ignore the ground underfoot: the DEM cell you stand on has no meaningful
 # local geometry. Terrain nearer than this still *occludes*; it just earns
-# nothing.
-NEAR_CUTOFF_M = 300.0
+# nothing. Three 30 m cells. It was 300 m, which also threw away the walls of
+# every small cirque lake: they rise from the shore, well inside 300 m.
+NEAR_CUTOFF_M = 90.0
+
+# Looming. Terrain seen above eye level counts up to 1 + LOOM_GAIN times as
+# much, rising linearly from the horizontal to full weight at LOOM_FULL_DEG
+# (the band's mid angle). Ground below the horizontal keeps weight 1, so a
+# summit's panorama is not penalised; a basin or a wall foot gains. The
+# design doc proposed this as a refinement ("terrain rising above your
+# horizon reads differently from terrain below it").
+LOOM_GAIN = 2.0
+LOOM_FULL_DEG = 20.0
 
 # How far each ray is marched. At gamma = 1 the per-steradian weight
 # d * exp(-d / 60 km) peaks at 60 km and is still a third of that peak at
@@ -84,6 +103,19 @@ RANGE_M = 150_000.0
 # same reason as the haze; the viewer asks for a second V at the slider height
 # separately, as a "what if", and never in place of this one.
 EYE_HEIGHT_M = panorama.EYE_HEIGHT_M
+
+# Survey lift: terrain occlusion and viewing angles are computed from this
+# much above the eye. The ground is a 30 m DEM interpolated bilinearly, so the
+# terrain next to a standing observer is a few large flat facets; at 2 m, one
+# gently convex facet underfoot hides ground a real person would see by
+# stepping a few metres, and V swings with every small move. The lift is
+# for the viewshed only: the canopy test still sightlines from the standing
+# eye (trees are not seen over), and the score is still reported at 2 m.
+# Tested from 0 to 6 m (eye 2-8 m) on 504 points with 15 m neighbours: the
+# swing of V over 15 m fell only from 7.1% to 6.6% while V rose 6-12%. Most
+# of the swing is the canopy, not the terrain (2.7% with trees transparent),
+# so the lift is left at 0.
+TERRAIN_LIFT_M = 0.0
 
 # Rays and radial step, set by convergence. Against a 2880-ray, 15 m
 # reference at four test points (Stuart summit, Colchuck Lake shore, Icicle
@@ -102,15 +134,49 @@ KNOT_M = 1000.0
 
 # Canopy occlusion. The DEM is bare earth: a viewpoint in forest "sees" the
 # walls above it through the trees. A line of sight is treated as inside the
-# canopy wherever it is less than CANOPY_H_M above tree-covered ground (the
-# WorldCover tree class), and is attenuated as exp(-metres inside /
-# CANOPY_MFP_M), the mean free path of a horizontal sightline through forest.
-# Only the first CANOPY_REACH_M count: beyond it a sightline still inside
-# canopy is already gone (exp(-600 / 40) ~ 3e-7), and one above it stays above.
+# canopy wherever it is less than CANOPY_H_M above forest (WorldCover's tree
+# class, as a share of each cell: CANOPY_SUBCELLS), and is attenuated as
+# exp(-metres inside / CANOPY_MFP_M), the mean free path of a horizontal
+# sightline through forest. Only the first CANOPY_REACH_M count: beyond it a
+# sightline still inside canopy is already gone (exp(-600 / 40) ~ 3e-7), and
+# one above it stays above.
 CANOPY_H_M = 30.0
 CANOPY_MFP_M = 40.0
 CANOPY_REACH_M = 600.0
 TREE_CLASS = 10
+# How much forest a DEM cell holds: the share of tree pixels among the
+# CANOPY_SUBCELLS x CANOPY_SUBCELLS land-cover pixels inside it (3 x 3 = all
+# nine 10 m WorldCover pixels of a 30 m cell), and a sightline's path through
+# the cell counts in that proportion. Reading one pixel per cell, as
+# nearest-neighbour resampling does, gave the same forest on average but
+# flipped cells between forest and open with every 10 m: on a lakeshore with
+# trees at its back, the worst tenth of points swung 20% over a 15 m step,
+# against 17% with the fraction.
+CANOPY_SUBCELLS = 3
+_TREE_COUNT: dict = {}
+
+
+def tree_count(landcover_path: Path, bounds, shape) -> np.ndarray:
+    """Tree pixels per DEM cell, 0..CANOPY_SUBCELLS**2, as uint8 on the DEM
+    grid. Read once per process; the full-resolution read is dropped as soon
+    as it is counted."""
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.windows import from_bounds
+    key = (str(landcover_path), tuple(np.round(np.asarray(bounds, float), 3)), tuple(shape))
+    hit = _TREE_COUNT.get(key)
+    if hit is None:
+        H, W = shape
+        k = CANOPY_SUBCELLS
+        with rasterio.open(landcover_path) as s:
+            sub = s.read(1, window=from_bounds(*bounds, transform=s.transform),
+                         out_shape=(H * k, W * k), boundless=True,
+                         fill_value=(s.nodata if s.nodata is not None else 0),
+                         resampling=Resampling.nearest)
+        hit = (sub == TREE_CLASS).reshape(H, k, W, k).sum(axis=(1, 3), dtype=np.uint8)
+        del sub
+        _TREE_COUNT[key] = hit
+    return hit
 
 # Land-cover interest weights, by ESA WorldCover class, in the doc's four
 # coarse groups plus built-up. The doc ranks glaciers above snow and ice, but
@@ -133,7 +199,7 @@ CLASS_WEIGHTS = {
 UNKNOWN_WEIGHT = 0.5
 
 # Bands for the distance breakdown, km.
-DIST_BANDS_KM = (0.3, 1, 3, 10, 30, 60, 100, 150)
+DIST_BANDS_KM = (NEAR_CUTOFF_M / 1000.0, 0.3, 1, 3, 10, 30, 60, 100, 150)
 
 # Rays are marched this many azimuths at a time, to bound memory: one chunk is
 # CHUNK_AZ x (RANGE_M / STEP_M) samples in several float64 arrays.
@@ -150,10 +216,12 @@ def version_tag() -> str:
     params = {
         "gamma": GAMMA, "d_haze_m": D_HAZE_M, "near_cutoff_m": NEAR_CUTOFF_M,
         "range_m": RANGE_M, "eye_m": EYE_HEIGHT_M, "n_az": N_AZ,
+        "terrain_lift_m": TERRAIN_LIFT_M,
         "step_m": STEP_M, "knot_m": KNOT_M,
         "class_weights": {str(k): w for k, (_n, w) in sorted(CLASS_WEIGHTS.items())},
         "canopy_h_m": CANOPY_H_M, "canopy_mfp_m": CANOPY_MFP_M,
-        "canopy_reach_m": CANOPY_REACH_M,
+        "canopy_reach_m": CANOPY_REACH_M, "canopy_subcells": CANOPY_SUBCELLS,
+        "loom_gain": LOOM_GAIN, "loom_full_deg": LOOM_FULL_DEG,
         "unknown_weight": UNKNOWN_WEIGHT,
         "refraction_k": panorama.REFRACTION_K, "earth_r": panorama.EARTH_R,
     }
@@ -172,7 +240,8 @@ def view_score(dem_path: Path, landcover_path: Path | None,
                lat: float, lon: float, *, gamma: float = GAMMA,
                n_az: int = N_AZ, step_m: float = STEP_M,
                range_m: float = RANGE_M,
-               eye_m: float = EYE_HEIGHT_M, canopy: bool = True) -> dict:
+               eye_m: float = EYE_HEIGHT_M, canopy: bool = True,
+               lift_m: float | None = None) -> dict:
     """V at (lat, lon), with the breakdown the viewer's score panel shows.
 
     The point is used as given: callers that want the snapped summit should
@@ -193,7 +262,9 @@ def view_score(dem_path: Path, landcover_path: Path | None,
         # grid, cached, so the class at a hit is the one the 3D view colours
         lc, _ = panorama._read_window(Path(landcover_path), dem_bounds,
                                       dem.shape, Resampling.nearest)
+        tcount = tree_count(Path(landcover_path), dem_bounds, dem.shape)
     lut = _class_lut()
+    tscale = 1.0 / CANOPY_SUBCELLS ** 2
 
     inv = ~dem_tf
     to_dem = Transformer.from_crs("EPSG:4326", dem_crs, always_xy=True)
@@ -203,7 +274,9 @@ def view_score(dem_path: Path, landcover_path: Path | None,
     if not bool(gok[0]):
         raise ValueError("viewpoint is outside the DEM or on a void")
     ground = float(gz[0])
-    eye_z = ground + eye_m
+    lift = TERRAIN_LIFT_M if lift_m is None else lift_m
+    eye_z = ground + eye_m + lift         # terrain: the surveyed eye
+    canopy_z = ground + eye_m             # canopy: the standing eye
 
     # ray geometry: azimuths x distances
     az = np.arange(n_az) * (360.0 / n_az)
@@ -244,6 +317,8 @@ def view_score(dem_path: Path, landcover_path: Path | None,
     om_class = {}
     n_reach = int(np.searchsorted(d, CANOPY_REACH_M, side="right"))
     v_open = 0.0                          # V with no canopy occlusion
+    v_flat = 0.0                          # V with no looming weight
+    loom_full = math.radians(LOOM_FULL_DEG)
     om_seen = 0.0                         # solid angle after occlusion
     dominance = extent = v_nohaze = om_weighted_c = 0.0
     lookdown = (math.inf, None, None)     # (angle rad, dist m, az deg)
@@ -286,6 +361,7 @@ def view_score(dem_path: Path, landcover_path: Path | None,
             cols = np.clip(np.floor(fc).astype(np.int64), 0, W - 1)
             rows = np.clip(np.floor(fr).astype(np.int64), 0, H - 1)
             cls = lc.ravel()[rows * W + cols].reshape(n, n_d)
+            tfrac = tcount.ravel()[rows * W + cols].reshape(n, n_d) * tscale
         else:
             cls = np.zeros((n, n_d), dtype=np.uint8)
         cw = lut[cls]
@@ -299,26 +375,31 @@ def view_score(dem_path: Path, landcover_path: Path | None,
             tau = np.zeros((n, n_d))
             jj = np.arange(n_d)[None, :]
             for k in range(n_reach):
-                tree = (cls[:, k] == TREE_CLASS) & alive[:, k]
+                tree = tfrac[:, k] * alive[:, k]      # share of the cell in forest
                 if not tree.any():
                     continue
-                gap = eye_z + d[k] * tan_t - gnd[:, k:k + 1]
-                inside = (gap < CANOPY_H_M) & (jj > k) & tree[:, None]
-                tau += inside * step_m
+                # the band's top edge, as seen from the standing eye
+                tan_s = tan_t + lift / np.maximum(d[None, :], 1.0)
+                gap = canopy_z + d[k] * tan_s - gnd[:, k:k + 1]
+                inside = (gap < CANOPY_H_M) & (jj > k)
+                tau += inside * (step_m * tree[:, None])
             trans = np.exp(-tau / CANOPY_MFP_M)
 
         om_open = d_alpha * ds * cutoff[None, :]            # sr, beyond cutoff
         om = om_open * trans                                # sr, as seen
-        base = d_alpha * ds * cw * w_d[None, :] * trans     # sr, weighted
+        # looming weight at each newly visible band's mid angle
+        loom = 1.0 + LOOM_GAIN * np.clip(0.5 * (prev + run) / loom_full, 0.0, 1.0)
+        base = d_alpha * ds * cw * w_d[None, :] * trans * loom   # sr, weighted
         contrib = base * pow_g[None, :]
 
         v_az[a0:a0 + n] = contrib.sum(axis=1)
-        v_open += float((d_alpha * ds * cw * w_d[None, :] * pow_g[None, :]).sum())
+        v_open += float((contrib / trans).sum())
+        v_flat += float((contrib / loom).sum())
         om_seen += float(om.sum())
         omega_az[a0:a0 + n] = om.sum(axis=1)
         dominance += float((base * pow_0[None, :]).sum())
         extent += float((base * pow_2[None, :]).sum())
-        v_nohaze += float((d_alpha * ds * cw * cutoff[None, :]
+        v_nohaze += float((d_alpha * ds * cw * cutoff[None, :] * trans * loom
                            * pow_g[None, :]).sum())
         om_weighted_c += float((om * cw).sum())
         np.add.at(v_band, band_idx, contrib.sum(axis=0))
@@ -387,8 +468,8 @@ def view_score(dem_path: Path, landcover_path: Path | None,
 
     return {
         "lat": lat, "lon": lon,
-        "ground_m": round(ground, 1), "eye_m": eye_m,
-        "V": V, "units": "sr·km", "version": version_tag(),
+        "ground_m": round(ground, 1), "eye_m": eye_m, "terrain_lift_m": lift,
+        "V": V, "units": f"sr·km^{gamma:g}", "version": version_tag(),
         "params": {
             "gamma": gamma, "d_haze_km": D_HAZE_M / 1000.0,
             "near_cutoff_m": NEAR_CUTOFF_M, "range_km": range_m / 1000.0,
@@ -400,12 +481,14 @@ def view_score(dem_path: Path, landcover_path: Path | None,
             "canopy": canopy and lc is not None,
             "canopy_h_m": CANOPY_H_M, "canopy_mfp_m": CANOPY_MFP_M,
             "canopy_reach_m": CANOPY_REACH_M,
+            "loom_gain": LOOM_GAIN, "loom_full_deg": LOOM_FULL_DEG,
         },
         "axes": {
             "dominance_sr": dominance,          # same sum at gamma = 0
             "extent_km2": extent,               # same sum at gamma = 2
             "v_no_haze": v_nohaze,
             "v_no_canopy": v_open,
+            "v_no_loom": v_flat,
         },
         "visible": {
             "omega_sr": omega,
@@ -414,6 +497,7 @@ def view_score(dem_path: Path, landcover_path: Path | None,
             "mean_class_weight": om_weighted_c / omega if omega else 0.0,
             "haze_factor": V / v_nohaze if v_nohaze else 0.0,
             "canopy_factor": V / v_open if v_open else 1.0,
+            "loom_factor": V / v_flat if v_flat else 1.0,
             "median_dist_km": med_d / 1000.0,
             "max_sightline_km": max_sight / 1000.0,
             "lookdown_deg": (math.degrees(lookdown[0])

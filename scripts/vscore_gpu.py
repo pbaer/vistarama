@@ -129,6 +129,7 @@ _KERNEL_SRC = r"""
 extern "C" __global__
 void march(const float* __restrict__ dem, const unsigned char* __restrict__ bad,
            const unsigned char* __restrict__ lc, const float* __restrict__ lut,
+           const unsigned char* __restrict__ tcount, const float tscale,
            const int H, const int W,
            const float* __restrict__ kc, const float* __restrict__ kr,
            const float* __restrict__ eye_z,
@@ -137,7 +138,8 @@ void march(const float* __restrict__ dem, const unsigned char* __restrict__ bad,
            const float step, const float knot_m, const float cutoff,
            const float d_haze, const float gamma, const float d_alpha,
            const float curv, const int n_reach, const float canopy_h,
-           const float canopy_mfp, const unsigned char tree_class,
+           const float canopy_mfp,
+           const float loom_gain, const float loom_full, const float lift,
            double* __restrict__ out)
 {
     const int ray = blockIdx.x * blockDim.x + threadIdx.x;
@@ -148,10 +150,10 @@ void march(const float* __restrict__ dem, const unsigned char* __restrict__ bad,
     const float ez = eye_z[p];
     float run = -1.57079632679f;
     double v = 0.0;
-    // the first n_reach samples' ground (curvature dropped) and tree flags,
+    // the first n_reach samples' ground (curvature dropped) and forest share,
     // for the canopy transmittance of every later sightline (see vscore.py)
     float g_near[MAX_REACH];
-    bool t_near[MAX_REACH];
+    float t_near[MAX_REACH];
     int n_near = 0;
     for (int j = 0; j < n_steps; ++j) {
         const float d = (float)(j + 1) * step;
@@ -188,20 +190,24 @@ void march(const float* __restrict__ dem, const unsigned char* __restrict__ bad,
             if (d >= cutoff) {
                 const float cw = lut[cls];
                 const float ds = 2.f * cosf(0.5f * (phi + run)) * sinf(0.5f * (phi - run));
+                // canopy: the line to the band's top, from the standing eye
                 float tau = 0.f;
-                const float tn = tanf(phi);
+                const float tn = tanf(phi) + lift / d;
+                const float es = ez - lift;
                 for (int k = 0; k < n_near; ++k) {
-                    if (t_near[k] && ez + (float)(k + 1) * step * tn - g_near[k] < canopy_h)
-                        tau += step;
+                    if (es + (float)(k + 1) * step * tn - g_near[k] < canopy_h)
+                        tau += step * t_near[k];
                 }
+                const float lm = fminf(fmaxf(0.5f * (phi + run) / loom_full, 0.f), 1.f);
                 v += (double)(d_alpha * ds * cw * expf(-d / d_haze)
-                              * powf(d * 0.001f, gamma) * expf(-tau / canopy_mfp));
+                              * powf(d * 0.001f, gamma) * expf(-tau / canopy_mfp)
+                              * (1.f + loom_gain * lm));
             }
             run = phi;
         }
         if (j < n_reach) {
             g_near[j] = g;
-            t_near[j] = cls == tree_class;
+            t_near[j] = (float)tcount[(size_t)ri * W + ci] * tscale;
             n_near = j + 1;
         }
     }
@@ -232,6 +238,8 @@ class GpuScorer:
         self.bad = cp.asarray(bad.astype(np.uint8))
         self.lc = cp.asarray(np.ascontiguousarray(lc, dtype=np.uint8))
         self.lut = cp.asarray(vscore._class_lut().astype(np.float32))
+        self.tcount = cp.asarray(np.ascontiguousarray(
+            vscore.tree_count(Path(landcover_path), bounds, dem.shape)))
         self.kernel = cp.RawKernel(_KERNEL_SRC, "march")
         self.knot_kernel = cp.RawKernel(_KNOTS_SRC, "knots")
         self.to_dem = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
@@ -278,7 +286,7 @@ class GpuScorer:
         oc, orr = self.inv * (np.asarray(X), np.asarray(Y))
         gz, gok = panorama._bilinear(self.dem_np, np.asarray(oc), np.asarray(orr),
                                      self.bad_np)
-        return np.where(gok, gz + vscore.EYE_HEIGHT_M, np.nan)
+        return np.where(gok, gz + vscore.EYE_HEIGHT_M + vscore.TERRAIN_LIFT_M, np.nan)
 
     def _prepare(self, lat: float, lon: float):
         """Fractional DEM cell coordinates of every ray's knots, and eye z."""
@@ -294,7 +302,7 @@ class GpuScorer:
         if not bool(gok[0]):
             return None
         return (np.asarray(fc, np.float32), np.asarray(fr, np.float32),
-                float(gz[0]) + vscore.EYE_HEIGHT_M)
+                float(gz[0]) + vscore.EYE_HEIGHT_M + vscore.TERRAIN_LIFT_M)
 
     def score(self, points: list[tuple[float, float]], progress=None) -> list[float | None]:
         """V for each (lat, lon); None where the point is off the DEM."""
@@ -316,7 +324,8 @@ class GpuScorer:
                 threads = 128
                 self.kernel(
                     ((n_rays + threads - 1) // threads,), (threads,),
-                    (self.dem, self.bad, self.lc, self.lut,
+                    (self.dem, self.bad, self.lc, self.lut, self.tcount,
+                     np.float32(1.0 / vscore.CANOPY_SUBCELLS ** 2),
                      np.int32(self.H), np.int32(self.W),
                      kc, kr, cp.asarray(ez),
                      np.int32(self.n_az), np.int32(nk), np.int32(self.n_steps),
@@ -327,7 +336,10 @@ class GpuScorer:
                      np.float32(2.0 * math.pi / self.n_az),
                      np.float32((1.0 - panorama.REFRACTION_K) / (2.0 * panorama.EARTH_R)),
                      np.int32(self.n_reach), np.float32(vscore.CANOPY_H_M),
-                     np.float32(vscore.CANOPY_MFP_M), np.uint8(vscore.TREE_CLASS),
+                     np.float32(vscore.CANOPY_MFP_M),
+                     np.float32(vscore.LOOM_GAIN),
+                     np.float32(math.radians(vscore.LOOM_FULL_DEG)),
+                     np.float32(vscore.TERRAIN_LIFT_M),
                      res))
                 per_point = res.reshape(len(ok), self.n_az).sum(axis=1).get()
                 for j, v in zip(ok, per_point):
