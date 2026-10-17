@@ -90,8 +90,10 @@
     varying vec3 vColor;
     varying float vDist;
     varying vec2 vWorld;
+    varying float vClipW;
     void main() {
       gl_Position = uMVP * vec4(aPos, 1.0);
+      vClipW = 1.0 + gl_Position.w;  // for the logarithmic depth, see render()
       vColor = aColor;
       vDist = length(aPos.xy - uEye.xy);
       vWorld = aPos.xy;          // metres east/north of the observer
@@ -114,6 +116,10 @@
     varying vec3 vColor;
     varying float vDist;
     varying vec2 vWorld;
+    #ifdef LOG_DEPTH
+    varying float vClipW;
+    uniform float uLogDepthF;    // 2 / log2(far + 1)
+    #endif
     uniform float uHaze;
     uniform vec3 uHazeColor;
     uniform sampler2D uTex0, uTex1, uTex2, uTex3;
@@ -176,7 +182,13 @@
       // exponential extinction toward the haze colour — atmospheric perspective
       float f = clamp(1.0 - exp(-vDist / uHaze), 0.0, 0.93);
       gl_FragColor = vec4(mix(base, uHazeColor, f), 1.0);
+      #ifdef LOG_DEPTH
+      gl_FragDepthEXT = log2(vClipW) * uLogDepthF * 0.5;
+      #endif
     }`;
+  // Prepended to TERRAIN_FS when EXT_frag_depth is available. The extension
+  // directive has to come before any other token in the source.
+  const LOG_DEPTH_FS_HEAD = '#extension GL_EXT_frag_depth : enable\n#define LOG_DEPTH 1\n';
 
   // Sky is drawn as a full-screen quad whose colour comes from the *world*
   // ray direction, so the gradient stays locked to the horizon as you pitch.
@@ -226,6 +238,12 @@
   const MIN_CLEAR_DEG = 0.22;
   const CLEAR_DIST_SCALE_M = 60000;
 
+  // Peak occlusion away from the mesh centre (see _visibility): the line to
+  // each summit is marched in steps growing by this factor, 2 m first, and
+  // during a walk the test waits until the camera has been still this long.
+  const VIS_MARCH_GROWTH = 1.025;
+  const VIS_WALK_MS = 250;
+
   // A summit earns a label only if it is a mountain in its own right, which
   // is what topographic prominence measures: elevation minus the highest col
   // on the lowest path to any higher ground.
@@ -254,7 +272,10 @@
     if (!gl) throw new Error('WebGL is not available in this browser');
     this.gl = gl;
 
-    this.terrainProg = program(gl, TERRAIN_VS, TERRAIN_FS);
+    // see render() for why depth is logarithmic, and what happens without it
+    this.logDepth = !!gl.getExtension('EXT_frag_depth');
+    this.terrainProg = program(gl, TERRAIN_VS,
+      (this.logDepth ? LOG_DEPTH_FS_HEAD : '') + TERRAIN_FS);
     this.skyProg = program(gl, SKY_VS, SKY_FS);
     this.quad = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
@@ -308,14 +329,31 @@
     this.onChange = null;
 
     this._installControls();
-    // No depth test: the mesh is a heightfield in polar coordinates centred on
-    // the camera, which never translates, so horizontal radius increases
-    // monotonically along every view ray and drawing bands outermost-first is
-    // exactly correct occlusion. That matters because a depth buffer cannot
-    // serve this scene: spanning 5 cm to 84 km, a 24-bit buffer quantises
-    // depth to kilometres at the far end, so any near plane close enough to
-    // avoid clipping the ground at your feet makes distant ridges z-fight.
-    gl.disable(gl.DEPTH_TEST);
+    // Occlusion. The scene spans 5 cm to 168 km, which an ordinary depth
+    // buffer cannot hold: 24 bits quantise depth as z^2 / (near * 2^24), so a
+    // near plane close enough not to clip the ground at your feet leaves
+    // kilometres of slop at the far end and distant ridges z-fight.
+    //
+    // This used to need no depth buffer at all: the bands are emitted
+    // outermost-first, and with the camera at the mesh centre horizontal
+    // radius only grows along a view ray, so buffer order alone was exact
+    // occlusion. Walking the camera (WASD) broke that. Off the centre, the
+    // ground around the centre is drawn last whatever its distance from the
+    // camera, so a summit painted itself over the slopes in front of a camera
+    // walked 100 m off it, as folded sheets with sawtooth edges.
+    //
+    // So the depth is logarithmic, written per fragment: log2(1 + w) over the
+    // whole range, which keeps a constant *relative* precision of ~1e-6 —
+    // about 10 cm at 100 km — and is exact wherever the camera stands. It
+    // costs early-Z, which buffer order never had anyway. Without
+    // EXT_frag_depth it falls back to buffer order alone: exact at the
+    // centre, wrong near the ground once the camera walks.
+    if (this.logDepth) {
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LEQUAL);
+    } else {
+      gl.disable(gl.DEPTH_TEST);
+    }
     gl.clearColor(0.06, 0.07, 0.09, 1);
   }
 
@@ -634,8 +672,9 @@
     // 2 branch and emitted a fan of long garbage triangles.
     //
     // Bands are emitted **outermost first**. GL rasterises primitives in
-    // buffer order, so that alone sorts the whole mesh back-to-front and the
-    // depth test can be switched off (see render()).
+    // buffer order, so with the camera at the centre that alone sorts the mesh
+    // back-to-front. It is the fallback occlusion when there is no
+    // logarithmic depth (see the constructor).
     // Counted first, then filled into a preallocated typed array. Pushing onto
     // a plain JS array cost roughly 25 bytes per index and reallocated as it
     // grew — survivable at 0.36M triangles, ruinous at the ~5M the isotropic
@@ -690,7 +729,7 @@
     this.data = { header, z, valid, radii, n_r,
                   counts: header.counts, offsets: header.offsets };
     this._vis = null;            // invalidate the cached occlusion test
-    this._visEye = null;
+    this._visKey = null;
     this.camOffset = [0, 0];     // a new mesh means a new centre
     this._meshGen = (this._meshGen || 0) + 1;   // and new camera matrices
     // NOT invalidating textures here: they are now fetched in parallel with
@@ -706,7 +745,7 @@
     this.data = null;
     this._meshGen = (this._meshGen || 0) + 1;
     this._vis = null;
-    this._visEye = null;
+    this._visKey = null;
     const gl = this.gl;
     this.resize();
     gl.clearColor(0.06, 0.07, 0.09, 1);
@@ -777,9 +816,10 @@
     const c = this.canvas;
     const aspect = c.width / Math.max(1, c.height);
     const far = this.data ? this.data.header.range_km * 1000 * 1.4 : 100000;
-    // 5 cm near plane. Nothing is gained by pushing it out — there is no depth
-    // buffer to preserve precision in — and at 2 m it clipped the ground under
-    // the observer's feet on steep terrain.
+    this._far = far;
+    // 5 cm near plane. Nothing is gained by pushing it out — the depth is
+    // logarithmic, so its precision does not depend on the near plane — and at
+    // 2 m it clipped the ground under the observer's feet on steep terrain.
     const proj = perspective(this.fov, aspect, 0.05, far);
     const view = lookAt(this.eye(), this.dir(), [0, 0, 1]);
     this._mtxKey = key;
@@ -821,6 +861,10 @@
     gl.uniformMatrix4fv(gl.getUniformLocation(this.terrainProg, 'uMVP'), false, mvp);
     gl.uniform3f(gl.getUniformLocation(this.terrainProg, 'uEye'), e[0], e[1], e[2]);
     gl.uniform1f(gl.getUniformLocation(this.terrainProg, 'uHaze'), this.hazeKm * 1000);
+    if (this.logDepth) {
+      gl.uniform1f(gl.getUniformLocation(this.terrainProg, 'uLogDepthF'),
+        2 / Math.log2(this._far + 1));
+    }
     for (let i = 0; i < 4; i++) {
       gl.activeTexture(gl.TEXTURE0 + i);
       gl.bindTexture(gl.TEXTURE_2D, this.tex[i]);
@@ -860,53 +904,87 @@
     if (this.onChange) this.onChange(this);
   };
 
-  /** Occlusion test for every named peak, cached against eye height.
+  /** Occlusion test for every named peak, cached against where the eye is.
    *
    *  This is the expensive half — up to ~1000 peaks each walking up to 300
    *  rings of atan2 — but it depends only on where the eye is, not on where it
    *  is looking. Caching it means dragging and zooming cost only the
-   *  projection below, and the horizon walk re-runs solely when the height
-   *  slider moves or a new mesh arrives.
+   *  projection below, and the horizon walk re-runs only when the eye moves
+   *  (height slider, WASD) or a new mesh arrives.
+   *
+   *  At the mesh centre the horizon toward a peak is read straight off the
+   *  rings along its azimuth. Once the camera has walked off the centre that
+   *  is the wrong line, and testing it put labels on summits hidden behind
+   *  the hill the camera now stood beside, so the line from the camera is
+   *  marched through the mesh instead (~45-65 ms for 1000 peaks). That is
+   *  too slow for every frame of a walk, so while the camera keeps moving
+   *  the previous labels are held, and the test runs once it has been still
+   *  for VIS_WALK_MS.
    */
   Pano3D.prototype._visibility = function () {
-    if (this._visEye === this.eyeHeight && this._vis) return this._vis;
+    const [ox, oy] = this.camOffset;
+    const atCentre = Math.hypot(ox, oy) < 0.5;
+    const key = `${this.eyeHeight},${ox},${oy}`;
+    if (this._visKey === key && this._vis) return this._vis;
+    // the eye has moved: note when, and wait for it to stay put
+    const now = performance.now();
+    if (this._visSeenKey !== key) { this._visSeenKey = key; this._visSeenT = now; }
+    if (!atCentre && this._vis && now - this._visSeenT < VIS_WALK_MS) {
+      clearTimeout(this._visTimer);
+      this._visTimer = setTimeout(() => { if (this.data) this.render(); }, VIS_WALK_MS);
+      return this._vis;
+    }
     const { header, z, valid, radii, n_r, counts, offsets } = this.data;
-    const eyeZ = header.ground_m + this.eyeHeight;
     const R = header.earth_r, k = header.refraction_k;
+    const eye = this.eye();
+    const eyeZ = atCentre ? header.ground_m + this.eyeHeight : eye[2];
     const out = [];
 
     for (const p of header.peaks) {
       const drop = (1 - k) * p.dist * p.dist / (2 * R);
-      const phi = Math.atan2(p.ele - eyeZ - drop, p.dist);
+      const th = p.az * Math.PI / 180;
+      const dx = p.dist * Math.sin(th) - eye[0], dy = p.dist * Math.cos(th) - eye[1];
+      const dist = atCentre ? p.dist : Math.hypot(dx, dy);   // from the eye
+      const phi = Math.atan2(p.ele - eyeZ - drop, dist);
 
-      // horizon along this azimuth, stopping well short of the summit so a
+      // horizon along the line to the summit, stopping well short of it so a
       // big massif is not occluded by its own flank
-      const back = Math.max(400, 0.12 * p.dist);
+      const back = Math.max(400, 0.12 * dist);
       let horizon = -Math.PI / 2;
-      for (let r = 1; r < n_r; r++) {
-        const d = radii[r];
-        if (d >= p.dist - back) break;
-        const c = counts[r];                     // rings differ in azimuth count
-        const i = offsets[r] + (Math.round(p.az / 360 * c) % c);
-        if (!valid[i]) continue;                 // extrapolated ground occludes nothing
-        const a = Math.atan2(z[i] - eyeZ, d);
-        if (a > horizon) horizon = a;
+      if (atCentre) {
+        for (let r = 1; r < n_r; r++) {
+          const d = radii[r];
+          if (d >= dist - back) break;
+          const c = counts[r];                   // rings differ in azimuth count
+          const i = offsets[r] + (Math.round(p.az / 360 * c) % c);
+          if (!valid[i]) continue;               // extrapolated ground occludes nothing
+          const a = Math.atan2(z[i] - eyeZ, d);
+          if (a > horizon) horizon = a;
+        }
+      } else {
+        const ux = dx / dist, uy = dy / dist;
+        for (let t = 2; t < dist - back; t *= VIS_MARCH_GROWTH) {
+          const h = this.heightAtWorld(eye[0] + ux * t, eye[1] + uy * t);
+          if (h === null) continue;
+          const a = Math.atan2(h - eyeZ, t);
+          if (a > horizon) horizon = a;
+        }
       }
       const clear = phi - horizon;
-      const need = MIN_CLEAR_DEG * (1 + p.dist / CLEAR_DIST_SCALE_M)
+      const need = MIN_CLEAR_DEG * (1 + dist / CLEAR_DIST_SCALE_M)
         * Math.PI / 180;
       if (clear < need) continue;
 
       out.push({
         name: p.name, ele: p.ele, az: p.az, dist: p.dist, drop,
         volcano: p.volcano, prom: p.prom,
-        dist_km: p.dist / 1000,
+        dist_km: dist / 1000,
         clear_deg: clear * 180 / Math.PI,
         // Metres the summit stands above the ridge in front of it. Clamped
         // below 90 deg: a close summit seen over a steeply downhill horizon
         // can clear it by more than a right angle, and tan() would then go
         // negative and rank a towering peak last.
-        stands: p.dist * Math.tan(Math.min(clear, 1.4)),
+        stands: dist * Math.tan(Math.min(clear, 1.4)),
       });
     }
     out.sort((a, b) => b.stands - a.stands);
@@ -960,7 +1038,8 @@
     }
 
     this._vis = merged;
-    this._visEye = this.eyeHeight;
+    this._visKey = key;
+    clearTimeout(this._visTimer);
     return merged;
   };
 

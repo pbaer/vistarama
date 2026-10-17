@@ -857,9 +857,9 @@ def terrain_mesh(dem_path: Path, hillshade_path: Path | None,
     `_adaptive_radii`), giving ~1.7M vertices at 120 km — sub-pixel silhouette
     error, and a browser draws it at ~3 ms a frame.
 
-    It also lets the client dispense with a depth buffer entirely: radius is
-    monotonic along every view ray from the centre, so drawing rings from the
-    outside in is exact occlusion. See pano3d.js.
+    Rings are emitted outside-in, which is exact occlusion from the centre;
+    the client also uses a logarithmic depth buffer so it stays exact once
+    the camera walks off the centre. See pano3d.js.
 
     Earth curvature is **baked into the vertex heights** as z - drop(r). The
     client can then use an ordinary flat-earth perspective camera and still get

@@ -136,7 +136,10 @@ opens at the bottom with a WebGL rendering of the surrounding terrain.
   you had clicked there: the marker and view wedge follow you as you walk,
   the cursor card measures distance and bearing from where you stand, and a
   range change rebuilds the panorama there. A click's leader line to the
-  summit it snapped to shows only while you are back on that summit.
+  summit it snapped to shows only while you are back on that summit. Peak
+  labels are re-tested for occlusion from where you stand once you stop
+  (a quarter-second after the last step), and terrain occludes correctly at
+  any distance from the centre (see the logarithmic depth note under traps).
 - **Snap up** jumps to the nearest higher summit (see below).
 - Hovering the panorama puts a red dot on the map, hovering the map puts one
   on the panorama, and the map's cursor card gives distance and bearing from
@@ -813,13 +816,20 @@ Each of these produced a plausible-looking but wrong result:
   60 km and distant ridges z-fight. Pushing the near plane out to 2 m instead
   clipped away the near ground entirely: on a steep face you saw straight
   through the slope you were standing on and out the underside of the mountain.
-  The way out is that this mesh does not need a depth buffer at all. It is a
-  heightfield in polar coordinates centred on a camera that only ever rotates,
-  so horizontal radius is monotonic along every view ray, and emitting the index
-  bands **outermost-first** is exact occlusion in a single draw call (GL
-  rasterises primitives in buffer order). Depth test off, near plane 5 cm.
-  Measured 0% missing-terrain pixels across 15 yaw/pitch cases versus 23–100%
-  before, at 2.2 ms/frame; losing early-Z costs nothing here.
+  The first way out was to need no depth buffer at all. The mesh is a
+  heightfield in polar coordinates centred on the camera, so horizontal radius
+  is monotonic along every view ray, and emitting the index bands
+  **outermost-first** is exact occlusion in a single draw call (GL rasterises
+  primitives in buffer order). Measured 0% missing-terrain pixels across 15
+  yaw/pitch cases versus 23–100% before, at 2.2 ms/frame.
+  That only holds while the camera stays at the centre. Once WASD could walk
+  it off, the ground around the centre was drawn last whatever its distance:
+  118 m off Cashmere's summit, the summit painted itself over the slopes in
+  front of the camera as folded sheets with sawtooth edges. The depth is now
+  **logarithmic**, written per fragment as `log2(1 + w)` scaled to the far
+  plane (`EXT_frag_depth`). Its precision is relative, ~1e-6 of the distance,
+  so ~10 cm at 100 km with the near plane still at 5 cm, and it is exact
+  wherever the camera stands. Buffer order stays as the fallback.
 - **The near ground needs rings for coverage, not detail.** Going from the
   centre vertex straight to a ring at 25 m makes the ground underfoot sixteen
   25 m triangles radiating from one point; on a steep face the uphill one
