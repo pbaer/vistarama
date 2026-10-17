@@ -21,20 +21,19 @@ photographs or image models are involved.
 | Interactive map viewer with LOD vector + raster tiles | ✅ working |
 | 3D "view from here" panorama, with peak identification | ✅ working |
 | Topographic prominence, joined from the Kirmse dataset | ✅ working |
-| **View score `V`** (the solid-angle integral) | 🔜 **designed, not built** |
+| **View score `V`** (the solid-angle integral), at the selected viewpoint | ✅ working |
 | Combining `V` with ruggedness `R` into one score | 🔜 designed, not built |
 | Canopy / built-up gating of candidate points | 🔜 layers exist, gate not applied |
 | Scoring pipeline over trails and POIs, producing rankings | 🔜 not started |
 | More AOIs: Alps, Scandinavia, Pyrenees | 🔜 sources chosen, nothing pulled |
 
-So far this is all inputs and instrumentation. The viewer came first because
-terrain data is hard to trust sight-unseen: nearly every bug found during the
-build showed up when someone looked at a place they knew and saw it come out
-wrong. Aggregate statistics hid all of them.
+The viewer came first because terrain data is hard to trust sight-unseen:
+nearly every bug found during the build showed up when someone looked at a place
+they knew and saw it come out wrong. Aggregate statistics hid all of them.
 
-`V` is next. `scripts/panorama.py` already walks rays outward from a viewpoint
-and tracks the running maximum elevation angle, which is the machinery the
-metric needs; it integrates solid angle over that walk instead of drawing it.
+`V` now exists for one point at a time: pick a viewpoint and a panel shows the
+score with every term that went into it (see [View score](#view-score)). Next
+is computing it at many points, which is what turns it into rankings.
 
 Everything runs on your own machine. There is no server and no cloud storage;
 the data is rebuilt from public sources locally.
@@ -84,7 +83,7 @@ A point's score combines two terms:
 V = Σ  ΔΩ · c(class) · w(d) · d^γ
 ```
 
-computed by marching the DEM outward along ~360 azimuths, tracking the running
+computed by marching the DEM outward along 720 azimuths, tracking the running
 maximum elevation angle. `γ ≈ 1` blends "how much of my visual field is filled"
 against "how much of the world can I see"; it is the main tuning knob.
 
@@ -228,6 +227,7 @@ Measured at a 1958×861 canvas, warm server:
 | mesh build (server) | ~1.8 s |
 | imagery textures (4 LOD levels, fetched alongside the mesh) | ~5.1 s |
 | click to finished panorama | ~5.4 s |
+| view score `V` (server, alongside the imagery) | ~1.5 s |
 | focus patches (4 × 2048², after the view settles) | ~1.8 s |
 
 Geometry is cheap: a modern GPU draws 3.7M triangles in a couple of
@@ -318,6 +318,84 @@ what the mesh and peak table report:
 Glacier Peak sits on the horizon to within a thousandth of a degree, and only
 does so with the curvature term in place.
 
+## View score
+
+`scripts/vscore.py` implements Part 1 of
+[docs/visibility-metric.md](docs/visibility-metric.md) for a single point:
+
+```
+V = Σ ΔΩ · c(class) · w(d) · d^γ        (d in km, so V is in sr·km)
+```
+
+One march per azimuth, 720 of them, in 30 m steps out to 150 km or the DEM's
+edge. Along each ray the running maximum elevation angle is the horizon so far.
+A sample that rises above it uncovers the band between the old and new angle,
+which has solid angle `Δα (sin φ_new − sin φ_old)` exactly. That band is
+credited at the sample's distance, with the land-cover class found there.
+Hidden ground never raises the maximum, so occlusion is free, and terrain
+seen edge-on sweeps almost no angle, so foreshortening is too.
+
+It uses the panorama's geometry throughout: the same DEM and bilinear
+sampling, the same curvature and refraction term, rays laid out in the same
+observer-centred azimuthal frame, and the snapped viewpoint the 3D view is
+drawn from. Ground nearer than the cutoff still blocks the view; it just
+earns nothing.
+
+| parameter | value | source |
+|---|---|---|
+| `γ` | 1.0 | the doc's starting value; tune within 0.8–1.3 |
+| `w(d)` near cutoff | 300 m | the doc |
+| `w(d)` haze taper | `exp(−d / 60 km)` | the doc; independent of the panorama's haze slider |
+| eye height | 2 m | fixed, so scores compare between points |
+| `c` snow and ice, bare / sparse, water | 1.0 | the doc's "high" group |
+| `c` moss and lichen | 0.8 | "medium-high" |
+| `c` grassland, shrubland, wetland | 0.6 | "medium" |
+| `c` tree cover, cropland | 0.3 | "low" |
+| `c` built-up | −0.5 | "negative" |
+| rays × step | 720 × 30 m | by convergence, below |
+
+Ray count barely matters. Against a 2880-ray, 15 m-step reference at four
+test points, 360 rays land within 1.2% and 720 within 0.6%. Halving the step
+moves V by a steady 0.4%; doubling it to 60 m costs up to 3.5%.
+
+The panel opens beside the map whenever a panorama loads. It shows:
+
+- **The terms, summarised:** visible solid angle, its median distance, `dᵞ`
+  there, the mean `c`, the haze factor, and the same sum at `γ = 0`
+  (dominance, sr) and `γ = 2` (extent, km²), the doc's two axes.
+- **V and solid angle by distance band and by land-cover class.**
+- **V by direction** in 10° columns, with the panorama camera's field of view
+  shaded.
+- **By-products** of the same march: sky fraction, horizon range, farthest
+  visible terrain, steepest look-down, the visible elevation range, and where
+  the DEM edge cuts the rays.
+- **All the parameters.**
+
+Bands the DEM edge cuts short are starred; their V is a lower bound. From the
+middle of this AOI that only affects the 60–150 km bands, which carry ~6% of a
+summit's score.
+
+First readings, all at the snapped viewpoint:
+
+| viewpoint | V | dominance | extent | median distance | V from ≤ 3 km | top class |
+|---|---|---|---|---|---|---|
+| Mount Stuart summit | **8.44** | 1.82 sr | 135 km² | 3.3 km | 18% | tree cover 35% |
+| Dragontail Peak summit | **5.28** | 1.36 sr | 105 km² | 3.2 km | 15% | bare / sparse 29% |
+| Colchuck Lake shore | **1.56** | 0.78 sr | 5.3 km² | 1.5 km | 65% | bare / sparse 36% |
+| Icicle Creek valley floor | **0.90** | 0.24 sr | 14.8 km² | 0.6 km | 9% | tree cover 62% |
+| Snoqualmie Pass | **0.54** | 0.40 sr | 1.5 km² | 1.0 km | 74% | tree cover 62% |
+
+The order is the intuitive one. Two things to note before reading the numbers
+as calibrated:
+
+- **Forest still earns a lot.** At `c = 0.3`, tree cover is the largest single
+  contributor from Stuart, because the valleys 3–10 km below it are forested
+  and fill a lot of solid angle. That is the class weights working as
+  specified, but it is the first thing the reference set should test.
+- **V is raw, in sr·km.** The doc normalises it to its median over a
+  reference region before combining with `R`; there is no reference region
+  yet.
+
 ## Layout
 
 ```
@@ -329,6 +407,7 @@ scripts/
   process.py      mosaic, reproject, derive metrics, build tiles + manifest
   tiles.py        XYZ pyramid writers (PNG and JPEG)
   panorama.py     polar mesh, summit snapping, panorama textures
+  vscore.py       the view score V at one point
   serve.py        local HTTP server and the /api endpoints
   aoi.py, colormaps.py
 viewer/     Leaflet map + WebGL panorama (Leaflet vendored, works offline)
@@ -712,10 +791,14 @@ Each of these produced a plausible-looking but wrong result:
 The viewer and its inputs are in good shape. The scoring itself is still
 missing.
 
-- **The view score `V` is unimplemented.** It is fully specified in
-  [docs/visibility-metric.md](docs/visibility-metric.md), and `panorama.py`
-  already contains the outward ray-march it needs, but nothing integrates
-  solid angle over that march, and no pipeline scores candidate points.
+- **`V` is scored one point at a time**, for whichever viewpoint is open.
+  Nothing scores trails or POIs in bulk yet. At ~1.5 s a point, that needs
+  the doc's `R` pre-filter and canopy/built-up gate first, or a faster march.
+- **`V` is uncalibrated.** There is no reference set of known-epic and
+  known-dull points to fit `γ` and `c` against, and no median to normalise by.
+  The doc ranks glaciers above snow and ice, but there is no glacier raster
+  (RGI needs a login; OSM glaciers are vectors), so WorldCover's snow-and-ice
+  class stands in for both.
 - **`R` is computed but never combined.** Ruggedness ships as a raster layer;
   the power-mean combination `S = (a·V^p + (1−a)·R^p)^(1/p)` is designed only.
 - **The canopy / built-up gate is not applied.** Both density layers exist and

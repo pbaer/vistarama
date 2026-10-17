@@ -17,6 +17,10 @@ Combined at the end. Companion to
 
 # Part 1 — The view score `V`
 
+**Implemented** for single points in `scripts/vscore.py`, shown in the
+viewer's score panel. The README's "View score" section has the parameters as
+built (720 rays × 30 m, numeric class weights) and the first readings.
+
 ---
 
 ## Two axes, not one
@@ -217,17 +221,17 @@ Re-marching costs 720k samples per point; storing costs well under 2 kB.
 
 Sampled at the **hit cell**, not at the observer. From ESA WorldCover + RGI:
 
-| Visible surface | Weight |
-|---|---|
-| Glacier (RGI polygon) | highest |
-| Snow and ice | high |
-| Bare / sparse vegetation — rock, scree, talus | high |
-| Permanent water | high |
-| Moss and lichen — tundra | medium-high |
-| Grassland, Shrubland | medium |
-| Tree cover | low |
-| Cropland | low |
-| Built-up | negative |
+| Visible surface | Weight | As built |
+|---|---|---|
+| Glacier (RGI polygon) | highest | — (no glacier raster yet) |
+| Snow and ice | high | 1.0 |
+| Bare / sparse vegetation — rock, scree, talus | high | 1.0 |
+| Permanent water | high | 1.0 |
+| Moss and lichen — tundra | medium-high | 0.8 |
+| Grassland, Shrubland | medium | 0.6 (herbaceous wetland too) |
+| Tree cover | low | 0.3 |
+| Cropland | low | 0.3 |
+| Built-up | negative | −0.5 |
 
 A refinement at no extra cost: weight by the elevation of the hit cell relative
 to the observer. Terrain rising above your horizon reads differently from

@@ -1113,10 +1113,8 @@ function destPoint(lat, lon, bearingDeg, distM) {
 function updatePanoFovOnMap(p) {
   if (!p || !p.data) return;
   const h = p.data.header;
-  const aspect = p.canvas.clientWidth / Math.max(1, p.canvas.clientHeight);
   // the camera's vertical fov is the parameter; the wedge needs horizontal
-  const hfov = 2 * Math.atan(Math.tan(p.fov * Math.PI / 360) * aspect)
-    * 180 / Math.PI;
+  const hfov = panoHfovDeg(p);
   const key = `${p.yaw.toFixed(1)}|${hfov.toFixed(1)}|${h.range_km}|${h.lat}`;
   if (key === panoFovKey) return;         // nothing moved; skip the redraw
   panoFovKey = key;
@@ -1344,6 +1342,7 @@ function updatePanoOverlay(p) {
 
   scheduleMapSync(p);
   scheduleFocus();
+  updateVsFov(p);
 
   $('pano-status').textContent =
     `bearing ${Math.round(p.yaw)}° · pitch ${p.pitch.toFixed(1)}° · fov `
@@ -1520,6 +1519,9 @@ async function renderPanorama(latlng, opts) {
   }
   if (seq !== panoSeq) { stopTicker(); return; }  // superseded by a later click
 
+  // the score needs only the snapped point, so it runs alongside the imagery
+  loadViewScore(header.lat, header.lon);
+
   setPhase('uploading mesh…', 'building triangles');
   try {
     pano.eyeHeight = sliderToEye(+$('pano-height').value);
@@ -1637,6 +1639,331 @@ function scheduleFocus() {
     pano.updateFocus(AOI);
   }, FOCUS_SETTLE_MS);
 }
+
+// ---------------------------------------------------------------------------
+// View score V (scripts/vscore.py, docs/visibility-metric.md).
+//
+// Computed once per viewpoint, at the panorama's own snapped coordinates, in
+// parallel with the imagery. It is a property of the place, not of the view:
+// eye height (2 m), haze (60 km) and range (150 km) are the score's own fixed
+// parameters, so moving the sliders or the camera does not change it.
+
+let vsSeq = 0;
+let vsLast = null;                 // { key, data } for the last point scored
+const VS_DIR_BIN = 10;             // degrees per column in the direction chart
+const VS_MIN_SHARE = 0.001;        // classes below this fold into "other"
+
+const vsFmt = (x) => {
+  const a = Math.abs(x);
+  return a >= 100 ? x.toFixed(0) : a >= 10 ? x.toFixed(1) : x.toFixed(2);
+};
+const vsPct = (x) => {
+  const p = x * 100;
+  return `${Math.abs(p) >= 10 || p === 0 ? p.toFixed(0) : p.toFixed(1)}%`;
+};
+const vsKm = (km) => (km >= 10 ? `${km.toFixed(0)} km` : km >= 1
+  ? `${km.toFixed(1)} km` : `${Math.round(km * 1000)} m`);
+
+/** Horizontal field of view of the panorama camera, degrees. */
+function panoHfovDeg(p) {
+  const aspect = p.canvas.clientWidth / Math.max(1, p.canvas.clientHeight);
+  return 2 * Math.atan(Math.tan(p.fov * Math.PI / 360) * aspect) * 180 / Math.PI;
+}
+
+async function loadViewScore(lat, lon) {
+  $('vscore').hidden = false;
+  $('vs-where').textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+  const key = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+  // a range change re-renders the panorama at the same point; V does not
+  // depend on the panorama's range, so reuse it
+  if (vsLast && vsLast.key === key) { renderViewScore(vsLast.data); return; }
+  const seq = ++vsSeq;
+  $('vs-value').textContent = '…';
+  $('vs-state').textContent = 'computing…';
+  $('vs-body').replaceChildren();
+  try {
+    const r = await fetch(`/api/vscore?lat=${lat}&lon=${lon}&slug=${AOI}`);
+    const data = await r.json();
+    if (seq !== vsSeq) return;                   // superseded by a later point
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    vsLast = { key, data };
+    renderViewScore(data);
+  } catch (err) {
+    if (seq !== vsSeq) return;
+    $('vs-value').textContent = '—';
+    $('vs-state').textContent = `failed: ${err.message}`;
+  }
+}
+
+/** A label/value row; both set as text, never as markup. */
+function vsRow(k, v) {
+  const r = el('div', 'vs-row');
+  r.append(el('span', 'k'), el('span', 'v'));
+  r.firstChild.textContent = k;
+  r.lastChild.textContent = v;
+  return r;
+}
+
+function vsSection(title) {
+  const s = el('div', 'vs-sec');
+  const h = el('h3');
+  h.textContent = title;
+  s.appendChild(h);
+  return s;
+}
+
+/** Share-of-V bars: one grid row per item, value and share at the tip. */
+function vsBars(items, maxShare) {
+  const g = el('div', 'vs-bars');
+  for (const it of items) {
+    const lbl = el('span', 'lbl');
+    if (it.swatch) {
+      const sw = el('span', 'vs-sw');
+      sw.style.background = it.swatch;
+      lbl.appendChild(sw);
+    }
+    lbl.appendChild(document.createTextNode(it.label));
+    const trk = el('span', 'trk');
+    const bar = el('span', `bar${it.share < 0 ? ' neg' : ''}`);
+    bar.style.width = `${Math.min(100, 100 * Math.abs(it.share) / maxShare)}%`;
+    trk.appendChild(bar);
+    const num = el('span', 'num');
+    const b = el('b');
+    b.textContent = vsFmt(it.v);
+    const sm = el('small');
+    sm.textContent = ` ${vsPct(it.share)} · ${it.omega.toFixed(2)} sr`;
+    num.append(b, sm);
+    g.append(lbl, trk, num);
+  }
+  return g;
+}
+
+function renderViewScore(d) {
+  const vis = d.visible, ax = d.axes, P = d.params;
+  $('vs-value').textContent = vsFmt(d.V);
+  $('vs-state').textContent = `${d.elapsed_ms} ms`;
+  const body = $('vs-body');
+  body.replaceChildren();
+
+  // --- the terms of the integral, summarised --------------------------------
+  const s1 = vsSection('What went in');
+  s1.append(
+    vsRow('Visible terrain, ΔΩ',
+      `${vis.omega_sr.toFixed(2)} sr (${vsPct(vis.omega_frac_sphere)} of sphere)`),
+    vsRow('Median distance, by solid angle', vsKm(vis.median_dist_km)),
+    vsRow('dᵞ at that distance', (vis.median_dist_km ** P.gamma).toFixed(2)),
+    vsRow('Mean land-cover weight c', vis.mean_class_weight.toFixed(2)),
+    vsRow('Haze factor w', `${vis.haze_factor.toFixed(2)} (V ${vsFmt(ax.v_no_haze)} without)`),
+  );
+  const s1b = el('div', 'vs-note');
+  s1b.textContent = 'The same sum at the two extremes of γ:';
+  s1.append(s1b,
+    vsRow('Dominance, γ = 0 (solid angle)', `${ax.dominance_sr.toFixed(2)} sr`),
+    vsRow('Extent, γ = 2 (visible area)', `${vsFmt(ax.extent_km2)} km²`));
+  body.appendChild(s1);
+
+  // --- by distance band ------------------------------------------------------
+  const s2 = vsSection('By distance');
+  const bands = d.by_distance;
+  const cut = bands.filter((b) => b.coverage < 0.99);
+  s2.appendChild(vsBars(bands.map((b) => ({
+    label: `${b.from_km}–${b.to_km} km${b.coverage < 0.99 ? '*' : ''}`,
+    v: b.v, share: b.share, omega: b.omega_sr,
+  })), Math.max(...bands.map((b) => Math.abs(b.share)), 1e-9)));
+  if (cut.length) {
+    const n = el('p', 'vs-note');
+    n.textContent = `* the DEM ends inside ${cut.length === 1 ? 'this band' : 'these bands'}`
+      + ` on some rays (${cut.map((b) => `${b.from_km}–${b.to_km} km: `
+      + `${vsPct(b.coverage)} covered`).join(', ')}), so their V is a lower bound.`;
+    s2.appendChild(n);
+  }
+  body.appendChild(s2);
+
+  // --- by land cover at the visible terrain ----------------------------------
+  const s3 = vsSection('By land cover at the visible terrain');
+  const colours = {};
+  const lcSpec = (manifest && manifest.raster_layers || []).find((l) => l.id === 'landcover');
+  for (const e of (lcSpec && lcSpec.legend) || []) {
+    colours[e.label] = `rgb(${e.color.join(',')})`;
+  }
+  const main = d.by_class.filter((c) => Math.abs(c.share) >= VS_MIN_SHARE);
+  const rest = d.by_class.filter((c) => Math.abs(c.share) < VS_MIN_SHARE);
+  const items = main.map((c) => ({
+    label: `${c.name} · c ${c.weight}`, swatch: colours[c.name] || '#8d97a3',
+    v: c.v, share: c.share, omega: c.omega_sr,
+  }));
+  if (rest.length) {
+    items.push({
+      label: `Other (${rest.length})`,
+      v: rest.reduce((a, c) => a + c.v, 0),
+      share: rest.reduce((a, c) => a + c.share, 0),
+      omega: rest.reduce((a, c) => a + c.omega_sr, 0),
+    });
+  }
+  s3.appendChild(vsBars(items, Math.max(...items.map((i) => Math.abs(i.share)), 1e-9)));
+  body.appendChild(s3);
+
+  // --- by direction ------------------------------------------------------------
+  const s4 = vsSection('By direction');
+  s4.appendChild(vsDirectionChart(d.by_azimuth.v, d.V));
+  const n4 = el('p', 'vs-note');
+  n4.textContent = 'Shaded: where the panorama camera is pointing.';
+  s4.appendChild(n4);
+  body.appendChild(s4);
+
+  // --- by-products of the same march -----------------------------------------
+  const s5 = vsSection('Also from the march');
+  s5.append(
+    vsRow('Sky', `${vsPct(vis.sky_frac_sphere)} of sphere`),
+    vsRow('Horizon', `${vis.horizon_min_deg.toFixed(2)}° to ${vis.horizon_max_deg >= 0 ? '+' : ''}`
+      + `${vis.horizon_max_deg.toFixed(2)}°`),
+    vsRow('Farthest visible terrain', vsKm(vis.max_sightline_km)),
+  );
+  if (vis.lookdown_deg !== null) {
+    s5.appendChild(vsRow('Steepest look-down',
+      `${vis.lookdown_deg.toFixed(1)}° at ${vsKm(vis.lookdown_dist_km)}, `
+      + `bearing ${Math.round(vis.lookdown_az)}°`));
+  }
+  if (vis.relief_min_m !== null) {
+    s5.appendChild(vsRow('Visible elevations',
+      `${Math.round(vis.relief_min_m)}–${Math.round(vis.relief_max_m)} m`));
+  }
+  const cov = d.coverage;
+  if (cov.nearest_edge_km !== null) {
+    s5.appendChild(vsRow('DEM edge along the rays',
+      `${vsKm(cov.nearest_edge_km)} nearest, ${vsKm(cov.median_edge_km)} median`));
+  }
+  body.appendChild(s5);
+
+  // --- parameters ------------------------------------------------------------
+  const det = el('details', 'vs-sec vs-params');
+  const sum = el('summary');
+  sum.textContent = 'Parameters';
+  det.appendChild(sum);
+  det.append(
+    vsRow('γ, distance exponent', String(P.gamma)),
+    vsRow('w(d): near cutoff', `${P.near_cutoff_m} m`),
+    vsRow('w(d): haze taper exp(−d / dₕ)', `dₕ = ${P.d_haze_km} km`),
+    vsRow('Observer', `${d.ground_m} m ground + ${d.eye_m} m eye`),
+    vsRow('March', `${P.n_az} rays × ${P.step_m} m to ${P.range_km} km`),
+    vsRow('Curvature + refraction', `k = ${P.refraction_k}`),
+  );
+  const cw = el('div', 'vs-bars');
+  for (const c of P.class_weights) {
+    const lbl = el('span', 'lbl');
+    const sw = el('span', 'vs-sw');
+    sw.style.background = colours[c.name] || '#8d97a3';
+    lbl.append(sw, document.createTextNode(c.name));
+    const num = el('span', 'num');
+    num.textContent = `c = ${c.weight}`;
+    cw.append(lbl, el('span'), num);
+  }
+  det.appendChild(cw);
+  body.appendChild(det);
+
+  if (pano) updateVsFov(pano);
+}
+
+/** Columns of V per VS_DIR_BIN degrees, compass-labelled, with a hover
+ *  readout per column and a band for the camera's current field of view. */
+function vsDirectionChart(perDeg, total) {
+  const n = 360 / VS_DIR_BIN;
+  const bins = new Array(n).fill(0);
+  perDeg.forEach((v, i) => { bins[Math.floor(i / VS_DIR_BIN) % n] += v; });
+  const max = Math.max(...bins, 1e-9);
+  const W = 360, H = 56, gap = 2, colW = W / n - gap, r = 3;
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag, attrs) => {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  };
+  const wrap = el('div', 'vs-dir');
+  const svg = mk('svg', { viewBox: `0 0 ${W} ${H + 14}`, preserveAspectRatio: 'none' });
+  const fov = mk('g', {});
+  fov.id = 'vs-fov';
+  svg.appendChild(fov);
+  const tip = el('div', 'vs-tip');
+  tip.hidden = true;
+  bins.forEach((v, i) => {
+    const x = i * (W / n) + gap / 2;
+    const h = Math.max(0, (v / max) * (H - 4));
+    const y = H - h;
+    // rounded at the data end, square on the baseline
+    const rr = Math.min(r, h, colW / 2);
+    const col = mk('path', {
+      class: 'col',
+      d: h <= 0 ? '' : `M${x},${H} V${y + rr} Q${x},${y} ${x + rr},${y} `
+        + `H${x + colW - rr} Q${x + colW},${y} ${x + colW},${y + rr} V${H} Z`,
+    });
+    // the hit target is the whole column slot, not just the bar
+    const hit = mk('rect', { class: 'hit', x: i * (W / n), y: 0, width: W / n, height: H });
+    const show = () => {
+      col.classList.add('hot');
+      const a0 = i * VS_DIR_BIN;
+      const b = el('b');
+      b.textContent = vsFmt(v);
+      const s = el('span');
+      s.textContent = ` ${vsPct(total ? v / total : 0)} · ${a0}–${a0 + VS_DIR_BIN}°`;
+      tip.replaceChildren(b, s);
+      tip.style.left = `${((i + 0.5) / n) * 100}%`;
+      tip.style.top = `${(y / (H + 14)) * 100}%`;
+      tip.hidden = false;
+    };
+    const hide = () => { col.classList.remove('hot'); tip.hidden = true; };
+    hit.addEventListener('pointerenter', show);
+    hit.addEventListener('pointerleave', hide);
+    svg.append(hit, col);
+  });
+  svg.appendChild(mk('line', { class: 'axis', x1: 0, x2: W, y1: H + 0.5, y2: H + 0.5 }));
+  for (const [deg, lab] of [[0, 'N'], [90, 'E'], [180, 'S'], [270, 'W'], [360, 'N']]) {
+    const t = mk('text', {
+      class: 'tick', x: deg, y: H + 12,
+      'text-anchor': deg === 0 ? 'start' : deg === 360 ? 'end' : 'middle',
+    });
+    t.textContent = lab;
+    svg.appendChild(t);
+  }
+  wrap.append(svg, tip);
+  return wrap;
+}
+
+/** Shade the camera's horizontal field of view on the direction chart. */
+function updateVsFov(p) {
+  const g = document.getElementById('vs-fov');
+  if (!g || !p || !p.data) return;
+  const half = Math.min(180, panoHfovDeg(p) / 2);
+  const a = ((p.yaw - half) % 360 + 360) % 360;
+  const spans = a + 2 * half <= 360 ? [[a, 2 * half]] : [[a, 360 - a], [0, a + 2 * half - 360]];
+  const key = spans.map((s) => s.map((v) => v.toFixed(1)).join(':')).join('|');
+  if (g.dataset.key === key) return;
+  g.dataset.key = key;
+  g.replaceChildren();
+  for (const [x, w] of spans) {
+    const rct = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    rct.setAttribute('class', 'fov');
+    rct.setAttribute('x', x);
+    rct.setAttribute('y', 0);
+    rct.setAttribute('width', w);
+    rct.setAttribute('height', 56);
+    g.appendChild(rct);
+  }
+}
+
+$('vs-toggle').addEventListener('click', () => {
+  const box = $('vscore');
+  const collapsed = box.classList.toggle('collapsed');
+  $('vs-toggle').setAttribute('aria-expanded', String(!collapsed));
+  $('vs-toggle').title = collapsed ? 'Expand' : 'Collapse';
+  try { localStorage.setItem('vs-collapsed', collapsed ? '1' : '0'); } catch (e) { /* private mode */ }
+});
+try {
+  if (localStorage.getItem('vs-collapsed') === '1') {
+    $('vscore').classList.add('collapsed');
+    $('vs-toggle').setAttribute('aria-expanded', 'false');
+    $('vs-toggle').title = 'Expand';
+  }
+} catch (e) { /* storage unavailable: start expanded */ }
 
 /** Publish the panel width and panorama height as CSS variables.
  *
@@ -1897,6 +2224,8 @@ window.addEventListener('blur', camStop);
 
 $('pano-close').addEventListener('click', () => {
   $('pano').hidden = true;
+  $('vscore').hidden = true;
+  vsSeq++;                                  // drop a score still in flight
   if (panoMarker) { map.removeLayer(panoMarker); panoMarker = null; }
   if (panoSnapLine) { map.removeLayer(panoSnapLine); panoSnapLine = null; }
   clearPanoFovOnMap();

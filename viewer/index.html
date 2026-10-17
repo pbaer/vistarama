@@ -54,6 +54,19 @@
     <p id="inspect-hint">move the cursor over the map</p>
   </aside>
 
+  <aside id="vscore" hidden aria-label="View score">
+    <header>
+      <h2>View score <span id="vs-where"></span></h2>
+      <button id="vs-toggle" class="vs-toggle" aria-expanded="true" title="Collapse">▾</button>
+    </header>
+    <div id="vs-hero">
+      <span id="vs-value">—</span><span class="vs-unit">sr·km</span>
+      <span id="vs-state"></span>
+    </div>
+    <div class="vs-formula">V = Σ ΔΩ · c(class) · w(d) · d<sup>γ</sup></div>
+    <div id="vs-body"></div>
+  </aside>
+
   <div id="status">
     <span id="pos">—</span>
     <span id="zoom">—</span>

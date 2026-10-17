@@ -133,6 +133,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._api_snap(parse_qs(parsed.query))
         if parsed.path == "/api/texture":
             return self._api_texture(parse_qs(parsed.query))
+        if parsed.path == "/api/vscore":
+            return self._api_vscore(parse_qs(parsed.query))
         if parsed.path in ("/", "/index.html"):
             self.send_response(302)
             self.send_header("Location", "/viewer/index.html")
@@ -281,6 +283,40 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+    def _api_vscore(self, q: dict):
+        """The view score V at one point, with its full breakdown.
+
+        The point is used exactly as given (no snapping): the viewer passes the
+        panorama's own, already snapped, coordinates so the score and the 3D
+        view describe the same spot.
+        """
+        try:
+            import vscore
+            lat = float(q.get("lat", ["nan"])[0])
+            lon = float(q.get("lon", ["nan"])[0])
+            slug = q.get("slug", ["alpine-lakes"])[0]
+            base = ROOT / "data"
+            result = vscore.view_score(
+                dem_path=base / "interim" / slug / "dem_5070.tif",
+                landcover_path=base / "interim" / slug / "landcover_5070.tif",
+                lat=lat, lon=lon)
+            body = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            msg = json.dumps({"error": str(exc)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
 
     def _api_texture(self, q: dict):
         """One LOD level of the panorama's world-space imagery texture."""

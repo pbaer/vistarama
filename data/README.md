@@ -97,6 +97,7 @@ reads them.
 | Imagery mosaics | `imagery.py` | file exists (`--fill-gaps` resumes a partial NAIP run) |
 | `peak_prominence.json` | `prominence.py` | rebuilt whenever it runs |
 | Panorama mesh + textures | `serve.py`, per request | never; only whole rasters are cached in memory |
+| View score `V` | `serve.py` via `vscore.py`, per request | never (the viewer reuses it for a range change at the same point) |
 
 The completion marker matters: "does this directory contain any PNG?" answers
 yes for a pyramid whose generation was interrupted half way, and that partial
