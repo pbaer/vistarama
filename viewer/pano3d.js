@@ -692,6 +692,7 @@
     this._vis = null;            // invalidate the cached occlusion test
     this._visEye = null;
     this.camOffset = [0, 0];     // a new mesh means a new centre
+    this._meshGen = (this._meshGen || 0) + 1;   // and new camera matrices
     // NOT invalidating textures here: they are now fetched in parallel with
     // this mesh and may already have landed for the same point. renderPanorama
     // invalidates once, up front, before either request goes out.
@@ -703,6 +704,7 @@
   Pano3D.prototype.blank = function () {
     this.indexCount = 0;
     this.data = null;
+    this._meshGen = (this._meshGen || 0) + 1;
     this._vis = null;
     this._visEye = null;
     const gl = this.gl;
@@ -761,7 +763,14 @@
     // rebuild is a perspective, a lookAt and a 4x4 multiply — plus, now that
     // the camera can be nudged, a mesh height lookup inside eye(). Recomputing
     // it 26 times to draw one frame was most of the overlay's cost.
-    const key = `${this.yaw},${this.pitch},${this.fov},${this.eyeHeight},`
+    //
+    // The key must include the mesh. The eye's altitude is the mesh's ground
+    // height plus eye height, and the far plane is its range, so a new
+    // viewpoint with an unchanged yaw/pitch/fov/eye height otherwise reused
+    // the previous viewpoint's matrices: the camera stayed at the old
+    // altitude, 1.2 km in the air after moving from Stuart's summit to the
+    // Icicle valley, or underground going the other way.
+    const key = `${this._meshGen},${this.yaw},${this.pitch},${this.fov},${this.eyeHeight},`
       + `${this.camOffset[0]},${this.camOffset[1]},`
       + `${this.canvas.width},${this.canvas.height}`;
     if (this._mtxKey === key) return this._mtx;
