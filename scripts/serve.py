@@ -296,11 +296,17 @@ class Handler(SimpleHTTPRequestHandler):
             lat = float(q.get("lat", ["nan"])[0])
             lon = float(q.get("lon", ["nan"])[0])
             slug = q.get("slug", ["alpine-lakes"])[0]
+            # optional: the score at another eye height, for the viewer's
+            # "at the slider height" comparison. Omitted means the standard 2 m.
+            eye = q.get("eye_m")
             base = ROOT / "data"
+            kw = {}
+            if eye:
+                kw["eye_m"] = min(5000.0, max(0.1, float(eye[0])))
             result = vscore.view_score(
                 dem_path=base / "interim" / slug / "dem_5070.tif",
                 landcover_path=base / "interim" / slug / "landcover_5070.tif",
-                lat=lat, lon=lon)
+                lat=lat, lon=lon, **kw)
             body = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

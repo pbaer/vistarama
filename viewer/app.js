@@ -352,7 +352,15 @@ const vectorRenderer = L.canvas({ tolerance: HIT_TOLERANCE_PX, padding: 0.3 });
 // and 28k trails, at a cost proportional to map area — which is exactly why
 // the panorama got choppier the larger the map pane was. Its own canvas keeps
 // that repaint to three shapes.
-const panoOverlayRenderer = L.canvas({ padding: 0.3 });
+//
+// It lives in its own pane that ignores the mouse. A canvas takes pointer
+// events wherever it covers the map, and this one sits above the feature
+// canvas, so in the shared overlay pane it swallowed every mousemove the
+// moment a panorama opened: feature hover and the hover card simply stopped.
+// Nothing drawn here is interactive, so letting events fall through costs
+// nothing.
+const PANO_OVERLAY_PANE = 'panoOverlay';
+const panoOverlayRenderer = L.canvas({ padding: 0.3, pane: PANO_OVERLAY_PANE });
 
 const map = L.map('map', {
   preferCanvas: true,
@@ -361,6 +369,11 @@ const map = L.map('map', {
   minZoom: 6,
   maxZoom: 15,
 });
+
+map.createPane(PANO_OVERLAY_PANE);
+// above the features (overlayPane is 400) and below markers and tooltips
+map.getPane(PANO_OVERLAY_PANE).style.zIndex = 450;
+map.getPane(PANO_OVERLAY_PANE).style.pointerEvents = 'none';
 
 L.control.scale({ imperial: true, metric: true, position: 'bottomleft' }).addTo(map);
 map.attributionControl.setPrefix('');
@@ -508,6 +521,180 @@ function styleFor(theme, props) {
   return st;
 }
 
+// ---------------------------------------------------------------------------
+// feature hover: highlight the feature under the cursor and describe it in a
+// card beside the pointer.
+//
+// Leaflet's canvas renderer already decides which feature is under the cursor
+// (the topmost one within HIT_TOLERANCE_PX) and fires mouseover/mouseout on
+// it, so there is no hit-testing here. The highlight is applied in place and
+// undone on mouseout. bringToFront would make it stand out more, but on a
+// shared canvas it permanently reorders the draw list: hover a lake once and
+// it covers every trail that crosses it from then on.
+
+const HOVER_WEIGHT_ADD = 2;       // px added to a hovered path's stroke
+const HOVER_RADIUS_MUL = 1.45;    // a hovered point symbol grows by this
+const HOVER_CARD_GAP = 14;        // px between the cursor and the card
+
+const SAC_LABEL = {
+  hiking: 'T1 · hiking',
+  mountain_hiking: 'T2 · mountain hiking',
+  demanding_mountain_hiking: 'T3 · demanding mountain hiking',
+  alpine_hiking: 'T4 · alpine hiking',
+  demanding_alpine_hiking: 'T5 · demanding alpine hiking',
+  difficult_alpine_hiking: 'T6 · difficult alpine hiking',
+};
+const VISIBILITY_LABEL = {
+  excellent: 'excellent', good: 'good', intermediate: 'intermittent',
+  bad: 'hard to follow', horrible: 'barely visible', no: 'no trail',
+};
+
+let hovered = null;               // { layer, base }
+
+/** Tag values read better without OSM's underscores. */
+const tagText = (v) => String(v).replace(/_/g, ' ');
+
+function formatEle(props) {
+  const m = parseFloat(String(props.ele || '').split(' ')[0]);
+  if (!Number.isFinite(m)) return null;
+  return `${Math.round(m).toLocaleString()} m · ${Math.round(m / 0.3048).toLocaleString()} ft`;
+}
+
+/** The few facts worth showing per theme, as [label, value] pairs. Only tags
+ *  that are present make it in, so a sparsely tagged feature gets a short
+ *  card rather than a column of dashes. */
+function hoverFacts(theme, p) {
+  const f = [];
+  const add = (k, v) => { if (v !== undefined && v !== null && v !== '') f.push([k, v]); };
+  switch (theme) {
+    case 'trails':
+      add('Difficulty', SAC_LABEL[p.sac_scale] || (p.sac_scale && tagText(p.sac_scale)));
+      add('Surface', p.surface ? tagText(p.surface) : null);
+      add('Visibility', VISIBILITY_LABEL[p.trail_visibility]);
+      add('Ref', p.ref);
+      break;
+    case 'roads':
+      add('Surface', IMPROVEMENT_LABELS[roadImprovement(p)]
+        + (p.surface ? ` (${tagText(p.surface)})` : ''));
+      add('Ref', p.ref);
+      add('Speed limit', p.maxspeed);
+      add('Lanes', p.lanes);
+      add('Access', p.access && p.access !== 'yes' ? tagText(p.access) : null);
+      break;
+    case 'peaks':
+      add('Elevation', formatEle(p));
+      add('Prominence', p.prominence ? `${p.prominence} m` : null);
+      add('Volcano', p['volcano:status'] ? tagText(p['volcano:status']) : null);
+      break;
+    case 'passes':
+      add('Elevation', formatEle(p));
+      add('Crossed by', p.highway ? tagText(p.highway) : null);
+      break;
+    case 'poi':
+      add('Elevation', formatEle(p));
+      add('Backcountry', p.backcountry === 'yes' ? 'yes' : null);
+      add('Fee', p.fee);
+      add('Drinking water', p.drinking_water);
+      add('Toilets', p.toilets);
+      add('Reservation', p.reservation ? tagText(p.reservation) : null);
+      add('Operator', p.operator);
+      break;
+    case 'water_areas':
+      add('Elevation', formatEle(p));
+      add('Intermittent', p.intermittent === 'yes' ? 'yes' : null);
+      break;
+    case 'water_lines':
+      add('Intermittent', p.intermittent === 'yes' ? 'yes' : null);
+      add('Underground', p.tunnel ? 'yes' : null);
+      break;
+    case 'glaciers':
+      add('Elevation', formatEle(p));
+      break;
+    case 'protected':
+      add('Designation', p.protection_title);
+      add('Operator', p.operator);
+      add('IUCN class', p.protect_class);
+      break;
+    default:
+      add('Elevation', formatEle(p));
+  }
+  return f;
+}
+
+function renderHoverCard(theme, props) {
+  const s = VECTOR_STYLE[theme];
+  const c = classOf(theme, props);
+  const card = $('hovercard');
+  card.replaceChildren();
+  const head = el('div', 'hc-head');
+  const sw = el('i');
+  sw.style.background = c.color;
+  const name = el('b');
+  name.textContent = props.name || c.label || s.label;
+  head.append(sw, name);
+  const sub = el('div', 'hc-sub');
+  sub.textContent = props.name && c.label !== s.label ? `${c.label} · ${s.label}` : s.label;
+  card.append(head, sub);
+  for (const [k, v] of hoverFacts(theme, props)) {
+    const row = el('div', 'hc-row');
+    const kk = el('span', 'k');
+    kk.textContent = k;
+    const vv = el('span', 'v');
+    vv.textContent = String(v);
+    row.append(kk, vv);
+    card.appendChild(row);
+  }
+  const foot = el('div', 'hc-foot');
+  foot.textContent = 'Alt-click for all tags';
+  card.appendChild(foot);
+  card.hidden = false;
+}
+
+/** Keep the card beside the pointer, flipping to the other side near the
+ *  window edges so it never runs off screen. */
+function placeHoverCard(clientX, clientY) {
+  const card = $('hovercard');
+  if (card.hidden) return;
+  const w = card.offsetWidth, h = card.offsetHeight;
+  let x = clientX + HOVER_CARD_GAP, y = clientY + HOVER_CARD_GAP;
+  if (x + w > innerWidth - 4) x = clientX - HOVER_CARD_GAP - w;
+  if (y + h > innerHeight - 4) y = clientY - HOVER_CARD_GAP - h;
+  card.style.left = `${Math.max(4, x)}px`;
+  card.style.top = `${Math.max(4, y)}px`;
+}
+
+function hoverStart(theme, layer, ev) {
+  if (hovered && hovered.layer !== layer) hoverEnd();
+  if (!hovered) {
+    const o = layer.options;
+    if (layer.setRadius) {
+      hovered = { layer, base: { radius: layer.getRadius(), weight: o.weight, color: o.color } };
+      layer.setRadius(hovered.base.radius * HOVER_RADIUS_MUL);
+      layer.setStyle({ weight: 2, color: '#ffffff' });
+    } else {
+      hovered = { layer, base: { weight: o.weight, opacity: o.opacity, fillOpacity: o.fillOpacity } };
+      const st = { weight: (o.weight || 1) + HOVER_WEIGHT_ADD, opacity: 1 };
+      if (o.fill) st.fillOpacity = Math.min(0.95, (o.fillOpacity ?? 0.5) + 0.15);
+      layer.setStyle(st);
+    }
+  }
+  renderHoverCard(theme, (layer.feature && layer.feature.properties) || {});
+  if (ev && ev.originalEvent) placeHoverCard(ev.originalEvent.clientX, ev.originalEvent.clientY);
+}
+
+function hoverEnd(layer) {
+  if (!hovered || (layer && hovered.layer !== layer)) return;
+  const { layer: l, base } = hovered;
+  if (l.setRadius) {
+    l.setRadius(base.radius);
+    l.setStyle({ weight: base.weight, color: base.color });
+  } else {
+    l.setStyle(base);
+  }
+  hovered = null;
+  $('hovercard').hidden = true;
+}
+
 function makeGeoJsonLayer(theme, data) {
   const s = VECTOR_STYLE[theme];
   const opts = {
@@ -535,10 +722,12 @@ function makeGeoJsonLayer(theme, data) {
           fill: true, fillColor: c.color, fillOpacity: 0.3,
         });
       }
+      // the full tag table, behind Alt-click (a plain click picks a viewpoint)
       lyr.bindPopup(tagTable(f.properties), { maxWidth: 320 });
-      if (f.properties && f.properties.name) {
-        lyr.bindTooltip(f.properties.name, { direction: 'top', opacity: 0.9 });
-      }
+      lyr.on('mouseover', (e) => hoverStart(theme, lyr, e));
+      lyr.on('mouseout', () => hoverEnd(lyr));
+      // a chunk swapped out for another LOD tier never sends mouseout
+      lyr.on('remove', () => hoverEnd(lyr));
     },
   };
   // L.GeoJSON applies `style` to every layer exposing setStyle(), which
@@ -861,9 +1050,9 @@ function updateStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// cursor inspector — reports every layer, not just the visible ones
+// cursor inspector — reports every raster layer, not just the visible ones.
+// Vector features are described by the hover card instead (hoverStart).
 
-const INSPECT_TOL_PX = HIT_TOLERANCE_PX;   // keep hover and inspector in sync
 const INSPECT_DEBOUNCE_MS = 110;
 const RASTER_ORDER = ['dem', 'slope', 'ruggedness', 'relief_sigma',
   'canopy_density', 'builtup_density', 'landcover', 'hillshade'];
@@ -872,88 +1061,9 @@ const RASTER_LABEL = {
   relief_sigma: 'Relief', canopy_density: 'Canopy',
   builtup_density: 'Built-up', landcover: 'Land cover', hillshade: 'Hillshade',
 };
-const SUMMARY_KEYS = ['highway', 'sac_scale', 'trail_visibility', 'surface',
-  'waterway', 'natural', 'water', 'tourism', 'amenity', 'ele', 'mountain_pass',
-  'leisure', 'boundary', 'operator', 'ref'];
 
 let inspectSeq = 0;
 let inspectTimer = null;
-
-/** Flatten Leaflet's nested latlng arrays into a list of rings. */
-function ringsOf(latlngs) {
-  if (!latlngs || !latlngs.length) return [];
-  if (latlngs[0] instanceof L.LatLng) return [latlngs];
-  return latlngs.flatMap(ringsOf);
-}
-
-function pointInRing(pt, ring) {
-  let inside = false;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const yi = ring[i].lat, xi = ring[i].lng;
-    const yj = ring[j].lat, xj = ring[j].lng;
-    if (((yi > pt.lat) !== (yj > pt.lat))
-      && (pt.lng < (xj - xi) * (pt.lat - yi) / (yj - yi) + xi)) inside = !inside;
-  }
-  return inside;
-}
-
-/** Distance test in screen space, so tolerance stays constant at any zoom. */
-function pathNear(layer, p, tolPx, isPoly) {
-  for (const ring of ringsOf(layer.getLatLngs())) {
-    let prev = null;
-    for (const ll of ring) {
-      const q = map.latLngToLayerPoint(ll);
-      if (prev) {
-        if (L.LineUtil.pointToSegmentDistance(p, prev, q) <= tolPx) return true;
-      } else if (p.distanceTo(q) <= tolPx) return true;
-      prev = q;
-    }
-    if (isPoly && pointInRing(map.layerPointToLatLng(p), ring)) return true;
-  }
-  return false;
-}
-
-function hitTestVectors(latlng) {
-  const p = map.latLngToLayerPoint(latlng);
-  const size = map.getSize();
-  const b = map.getBounds();
-  const tolX = (b.getEast() - b.getWest()) / size.x * INSPECT_TOL_PX;
-  const tolY = (b.getNorth() - b.getSouth()) / size.y * INSPECT_TOL_PX;
-  const box = L.latLngBounds(
-    [latlng.lat - tolY, latlng.lng - tolX],
-    [latlng.lat + tolY, latlng.lng + tolX],
-  );
-
-  const hits = [];
-  for (const theme of [...VECTOR_ORDER].reverse()) {
-    const st = vectorLayers[theme];
-    if (!st || !st.enabled) continue;
-    const isPoly = VECTOR_STYLE[theme].kind === 'poly';
-    st.onMap.forEach((gj) => {
-      gj.eachLayer((l) => {
-        if (hits.length >= 24) return;
-        if (l.getLatLng) {
-          if (box.contains(l.getLatLng())) hits.push({ theme, f: l.feature });
-          return;
-        }
-        if (!l.getBounds) return;
-        const lb = l.getBounds();
-        // cheap bbox reject first; the segment test below is the expensive bit
-        if (!lb.isValid() || !lb.overlaps(box)) return;
-        if (pathNear(l, p, INSPECT_TOL_PX, isPoly)) hits.push({ theme, f: l.feature });
-      });
-    });
-  }
-  return hits;
-}
-
-function summarise(props) {
-  const parts = [];
-  for (const k of SUMMARY_KEYS) {
-    if (props[k] !== undefined) parts.push(`${k}=${props[k]}`);
-  }
-  return parts.slice(0, 4).join('   ');
-}
 
 const COMPASS_16 = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
                     'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
@@ -997,7 +1107,7 @@ function renderViewpointOffset(latlng) {
     : `${Math.round(bearing) % 360}° ${COMPASS_16[Math.round(bearing / 22.5) % 16]}`);
 }
 
-function renderInspector(latlng, rasters, hits) {
+function renderInspector(latlng, rasters) {
   document.getElementById('inspect-hint').hidden = true;
   document.getElementById('inspect-pos').textContent =
     `${latlng.lat.toFixed(5)}, ${latlng.lng.toFixed(5)}`;
@@ -1019,40 +1129,18 @@ function renderInspector(latlng, rasters, hits) {
     row.appendChild(el('span', cls, text));
     rbox.appendChild(row);
   });
-
-  const vbox = document.getElementById('inspect-vector');
-  vbox.innerHTML = '';
-  if (!hits.length) return;
-  vbox.appendChild(el('div', 'ins-sep',
-    `${hits.length} feature${hits.length === 1 ? '' : 's'} near cursor`));
-  hits.slice(0, 12).forEach(({ theme, f }) => {
-    const s = VECTOR_STYLE[theme];
-    const props = (f && f.properties) || {};
-    const c = classOf(theme, props);
-    const d = el('div', 'ins-feature');
-    const t = el('div', 'ft');
-    const sw = el('i');
-    sw.style.background = c.color;
-    t.appendChild(sw);
-    t.appendChild(el('span', null, escapeHtml(props.name || c.label || s.label)));
-    d.appendChild(t);
-    const detail = summarise(props);
-    if (detail) d.appendChild(el('div', 'fsub', escapeHtml(detail)));
-    vbox.appendChild(d);
-  });
 }
 
 async function updateInspector(latlng) {
   const seq = ++inspectSeq;
-  const hits = hitTestVectors(latlng);
   let rasters = null;
   try {
     const r = await fetch(
       `/api/point?lat=${latlng.lat}&lon=${latlng.lng}&slug=${AOI}`);
     if (r.ok) rasters = (await r.json()).layers;
-  } catch (err) { /* server down — still show the vector hits */ }
+  } catch (err) { /* server down — the rows show as missing */ }
   if (seq !== inspectSeq) return;   // a later move superseded this one
-  renderInspector(latlng, rasters, hits);
+  renderInspector(latlng, rasters);
 }
 
 map.on('mousemove', (ev) => {
@@ -1061,8 +1149,11 @@ map.on('mousemove', (ev) => {
   // not debounced: this is pure arithmetic against data already in memory, and
   // a laggy dot would defeat the point of the pairing
   showMapCursorOnPano(ev.latlng);
+  if (hovered) placeHoverCard(ev.originalEvent.clientX, ev.originalEvent.clientY);
 });
-map.on('mouseout', () => showMapCursorOnPano(null));
+map.on('mouseout', () => { showMapCursorOnPano(null); hoverEnd(); });
+// the feature under a still cursor changes when the map moves under it
+map.on('movestart zoomstart', () => hoverEnd());
 window.mapView.inspect = updateInspector;
 
 // ---------------------------------------------------------------------------
@@ -1643,13 +1734,17 @@ function scheduleFocus() {
 // ---------------------------------------------------------------------------
 // View score V (scripts/vscore.py, docs/visibility-metric.md).
 //
-// Computed once per viewpoint, at the panorama's own snapped coordinates, in
-// parallel with the imagery. It is a property of the place, not of the view:
-// eye height (2 m), haze (60 km) and range (150 km) are the score's own fixed
-// parameters, so moving the sliders or the camera does not change it.
+// Computed for the panorama's own snapped viewpoint, in parallel with the
+// imagery, and again wherever the camera is walked to with WASD/arrows once it
+// has stood still for VS_MOVE_SETTLE_MS. It is a property of the place, not
+// of the view: eye height (2 m), haze (60 km) and range (150 km) are the
+// score's own fixed parameters, so the sliders and the gaze do not change it.
 
 let vsSeq = 0;
-let vsLast = null;                 // { key, data } for the last point scored
+const vsCache = new Map();         // "lat,lon" -> result, most recent last
+const VS_CACHE_MAX = 32;
+const VS_MOVE_SETTLE_MS = 500;
+let vsMoveTimer = null;
 const VS_DIR_BIN = 10;             // degrees per column in the direction chart
 const VS_MIN_SHARE = 0.001;        // classes below this fold into "other"
 
@@ -1670,29 +1765,182 @@ function panoHfovDeg(p) {
   return 2 * Math.atan(Math.tan(p.fov * Math.PI / 360) * aspect) * 180 / Math.PI;
 }
 
-async function loadViewScore(lat, lon) {
-  $('vscore').hidden = false;
-  $('vs-where').textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+/** Score a point and show it.
+ *
+ *  `movedM` is set when the point is the camera walked away from the
+ *  viewpoint: the old breakdown then stays up, dimmed, until the new one
+ *  lands, rather than blanking the panel on every step. */
+async function loadViewScore(lat, lon, movedM) {
+  clearTimeout(vsMoveTimer);
+  const box = $('vscore');
+  box.hidden = false;
+  $('vs-where').textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`
+    + (movedM >= 0.5 ? ` · moved ${Math.round(movedM)} m` : '');
   const key = `${lat.toFixed(6)},${lon.toFixed(6)}`;
-  // a range change re-renders the panorama at the same point; V does not
-  // depend on the panorama's range, so reuse it
-  if (vsLast && vsLast.key === key) { renderViewScore(vsLast.data); return; }
+  vsPoint = { lat, lon };
+  // the slider-height comparison waits for the 2 m score; until then the one
+  // on screen belongs to the previous point
+  clearTimeout(vsAltTimer);
+  vsAltSeq++;
+  $('vs-alt').classList.add('stale');
+  // a range change re-renders the panorama at the same point, and 0 walks the
+  // camera back to it; V depends on neither, so reuse what was computed
+  const hit = vsCache.get(key);
+  if (hit) {
+    vsSeq++;                                     // drop anything in flight
+    vsCache.delete(key); vsCache.set(key, hit);  // most recent last
+    renderViewScore(hit);
+    loadAltScore();
+    return;
+  }
   const seq = ++vsSeq;
-  $('vs-value').textContent = '…';
   $('vs-state').textContent = 'computing…';
-  $('vs-body').replaceChildren();
+  if (movedM === undefined) {
+    $('vs-value').textContent = '…';
+    $('vs-body').replaceChildren();
+  } else {
+    box.classList.add('stale');
+  }
   try {
     const r = await fetch(`/api/vscore?lat=${lat}&lon=${lon}&slug=${AOI}`);
     const data = await r.json();
     if (seq !== vsSeq) return;                   // superseded by a later point
     if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
-    vsLast = { key, data };
+    vsCache.set(key, data);
+    if (vsCache.size > VS_CACHE_MAX) vsCache.delete(vsCache.keys().next().value);
     renderViewScore(data);
+    loadAltScore();
   } catch (err) {
     if (seq !== vsSeq) return;
+    box.classList.remove('stale');
     $('vs-value').textContent = '—';
     $('vs-state').textContent = `failed: ${err.message}`;
   }
+}
+
+/** Where the camera stands, as lat/lon: the mesh centre plus the camera
+ *  offset, which is metres east and north in the mesh's observer-centred
+ *  frame, so a bearing and a distance from the centre. */
+function cameraLatLng(p) {
+  const h = p.data.header;
+  const [ox, oy] = p.camOffset;
+  const d = Math.hypot(ox, oy);
+  if (d < 0.5) return { lat: h.lat, lon: h.lon, moved: 0 };
+  const [lat, lon] = destPoint(h.lat, h.lon, Math.atan2(ox, oy) * 180 / Math.PI, d);
+  return { lat, lon, moved: d };
+}
+
+/** Called on every camera nudge and key release: mark the score stale now,
+ *  and recompute it where the camera stands once movement has settled, i.e.
+ *  no movement key is held and none has moved the camera for
+ *  VS_MOVE_SETTLE_MS. Waiting on the keys as well as the clock matters: when
+ *  frames arrive slowly (a busy or background tab) the gap between two steps
+ *  of one held key can exceed the timeout, which fetched mid-walk. */
+function scheduleScoreAtCamera() {
+  if (!pano || !pano.data || $('vscore').hidden) return;
+  $('vscore').classList.add('stale');
+  $('vs-state').textContent = 'moved…';
+  clearTimeout(vsMoveTimer);
+  if (camHeld.size) return;                // keyup schedules it
+  vsMoveTimer = setTimeout(() => {
+    if (!pano || !pano.data || $('pano').hidden) return;
+    const c = cameraLatLng(pano);
+    loadViewScore(c.lat, c.lon, c.moved);
+  }, VS_MOVE_SETTLE_MS);
+}
+
+// --- the same score at the panorama's eye height ---------------------------
+//
+// V is always scored at a standing 2 m, so it compares between points. This
+// is a second figure beside it: V for the same spot at whatever height the
+// eye slider is set to, to show how much a viewpoint gains from height. It is
+// never used in place of the 2 m score, and it is fetched only after that one
+// has landed, so the real number always arrives first.
+
+const VS_STD_EYE_M = 2;
+const VS_ALT_MIN_DIFF_M = 0.5;     // nearer 2 m than this is the same score
+const VS_ALT_SETTLE_MS = 500;
+let vsPoint = null;                // { lat, lon } the panel is scoring
+let vsMainV = null;                // the 2 m score at vsPoint, once known
+let vsAltSeq = 0;
+let vsAltTimer = null;
+let vsAltShown = null;             // { eye, v } currently displayed
+const vsAltCache = new Map();
+
+/** The slider's eye height, rounded so that small slider jitter maps to the
+ *  same request: half metres below 10 m, whole metres above. */
+function vsAltEye() {
+  const h = pano ? pano.eyeHeight : VS_STD_EYE_M;
+  return h < 10 ? Math.round(h * 2) / 2 : Math.round(h);
+}
+
+function vsEyeLabel(eye) {
+  return eye < 1000 ? `${eye} m` : `${(eye / 1000).toFixed(2)} km`;
+}
+
+/** Draw the comparison line; `v` null means it is still being computed. */
+function showAltScore(eye, v) {
+  vsAltShown = { eye, v };
+  const box = $('vs-alt');
+  const lbl = el('span', 'k');
+  lbl.textContent = `At ${vsEyeLabel(eye)} eye height`;
+  const val = el('span', 'v');
+  if (v === null) {
+    val.textContent = 'computing…';
+  } else {
+    const b = el('b');
+    b.textContent = vsFmt(v);
+    val.append(b, document.createTextNode(' sr·km'));
+    if (vsMainV) {
+      const d = v / vsMainV - 1;
+      const pct = el('small');
+      pct.textContent = ` ${d >= 0 ? '+' : '−'}${vsPct(Math.abs(d))} vs 2 m`;
+      val.appendChild(pct);
+    }
+  }
+  box.replaceChildren(lbl, val);
+  box.hidden = false;
+}
+
+async function loadAltScore() {
+  clearTimeout(vsAltTimer);
+  const box = $('vs-alt');
+  box.classList.remove('stale');
+  if (!vsPoint || !pano) { box.hidden = true; return; }
+  const eye = vsAltEye();
+  if (Math.abs(eye - VS_STD_EYE_M) < VS_ALT_MIN_DIFF_M) {
+    vsAltSeq++;
+    vsAltShown = null;
+    box.hidden = true;
+    return;
+  }
+  const { lat, lon } = vsPoint;
+  const key = `${lat.toFixed(6)},${lon.toFixed(6)},${eye}`;
+  const hit = vsAltCache.get(key);
+  if (hit !== undefined) { vsAltSeq++; showAltScore(eye, hit); return; }
+  const seq = ++vsAltSeq;
+  showAltScore(eye, null);
+  try {
+    const r = await fetch(`/api/vscore?lat=${lat}&lon=${lon}&slug=${AOI}&eye_m=${eye}`);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    vsAltCache.set(key, data.V);
+    if (vsAltCache.size > VS_CACHE_MAX) vsAltCache.delete(vsAltCache.keys().next().value);
+    if (seq === vsAltSeq) showAltScore(eye, data.V);
+  } catch (err) {
+    if (seq !== vsAltSeq) return;
+    const val = el('span', 'v');
+    val.textContent = `failed: ${err.message}`;
+    box.replaceChildren(val);
+  }
+}
+
+/** The eye slider moved: dim the comparison now, refetch once it settles. */
+function scheduleAltScore() {
+  if (!vsPoint || $('vscore').hidden) return;
+  clearTimeout(vsAltTimer);
+  $('vs-alt').classList.add('stale');
+  vsAltTimer = setTimeout(loadAltScore, VS_ALT_SETTLE_MS);
 }
 
 /** A label/value row; both set as text, never as markup. */
@@ -1740,6 +1988,8 @@ function vsBars(items, maxShare) {
 
 function renderViewScore(d) {
   const vis = d.visible, ax = d.axes, P = d.params;
+  $('vscore').classList.remove('stale');
+  vsMainV = d.V;
   $('vs-value').textContent = vsFmt(d.V);
   $('vs-state').textContent = `${d.elapsed_ms} ms`;
   const body = $('vs-body');
@@ -2150,6 +2400,7 @@ function updateCamOffsetBadge() {
   const d = Math.hypot(ox, oy);
   // clear the state as well as hiding it, or a reset leaves the warning class
   // and text sitting on a hidden element
+  scheduleScoreAtCamera();
   if (d < 0.5) { el.hidden = true; el.classList.remove('warn'); el.textContent = ''; return; }
   const brg = ((Math.atan2(ox, oy) * 180 / Math.PI) % 360 + 360) % 360;
   const far = d > CAM_OFFSET_WARN_M;
@@ -2175,9 +2426,12 @@ function camNudge(sideways, forward, metres) {
 }
 
 function camStop() {
+  const wasMoving = camHeld.size > 0;
   camHeld.clear();
   if (camRaf) cancelAnimationFrame(camRaf);
   camRaf = null;
+  // a blur ends the walk without a keyup, so it has to schedule the score too
+  if (wasMoving) scheduleScoreAtCamera();
 }
 
 function camLoop(t) {
@@ -2215,9 +2469,10 @@ document.addEventListener('keydown', (ev) => {
 
 document.addEventListener('keyup', (ev) => {
   const k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
-  camHeld.delete(k);
+  const wasMoving = camHeld.delete(k);
   if (ev.key === 'Shift') camFast = false;
   if (!camHeld.size && camRaf) { cancelAnimationFrame(camRaf); camRaf = null; }
+  if (wasMoving && !camHeld.size) scheduleScoreAtCamera();
 });
 // a key held while the window loses focus never sends keyup
 window.addEventListener('blur', camStop);
@@ -2226,6 +2481,8 @@ $('pano-close').addEventListener('click', () => {
   $('pano').hidden = true;
   $('vscore').hidden = true;
   vsSeq++;                                  // drop a score still in flight
+  vsAltSeq++;
+  clearTimeout(vsAltTimer);
   if (panoMarker) { map.removeLayer(panoMarker); panoMarker = null; }
   if (panoSnapLine) { map.removeLayer(panoSnapLine); panoSnapLine = null; }
   clearPanoFovOnMap();
@@ -2246,6 +2503,7 @@ $('pano-height').addEventListener('input', () => {
   $('pano-height-val').textContent = h < 1000 ? `${h.toFixed(0)} m`
     : `${(h / 1000).toFixed(2)} km`;
   if (pano) pano.setView({ eyeHeight: h });
+  scheduleAltScore();
 });
 
 $('pano-reset').addEventListener('click', () => {

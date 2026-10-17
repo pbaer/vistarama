@@ -50,9 +50,10 @@
     <h2>At cursor <span id="inspect-pos"></span></h2>
     <div id="inspect-view"></div>
     <div id="inspect-raster"></div>
-    <div id="inspect-vector"></div>
     <p id="inspect-hint">move the cursor over the map</p>
   </aside>
+
+  <div id="hovercard" hidden role="tooltip"></div>
 
   <aside id="vscore" hidden aria-label="View score">
     <header>
@@ -63,6 +64,7 @@
       <span id="vs-value">—</span><span class="vs-unit">sr·km</span>
       <span id="vs-state"></span>
     </div>
+    <div id="vs-alt" hidden></div>
     <div class="vs-formula">V = Σ ΔΩ · c(class) · w(d) · d<sup>γ</sup></div>
     <div id="vs-body"></div>
   </aside>

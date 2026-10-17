@@ -66,8 +66,9 @@ NEAR_CUTOFF_M = 300.0
 RANGE_M = 150_000.0
 
 # Observer height above the ground. A standing person, matching the panorama's
-# default eye height, and fixed rather than tied to the slider for the same
-# reason as the haze.
+# default eye height. This is the score's own value, not the slider's, for the
+# same reason as the haze; the viewer asks for a second V at the slider height
+# separately, as a "what if", and never in place of this one.
 EYE_HEIGHT_M = panorama.EYE_HEIGHT_M
 
 # Rays and radial step, set by convergence. Against a 2880-ray, 15 m
@@ -123,7 +124,8 @@ def _class_lut() -> np.ndarray:
 def view_score(dem_path: Path, landcover_path: Path | None,
                lat: float, lon: float, *, gamma: float = GAMMA,
                n_az: int = N_AZ, step_m: float = STEP_M,
-               range_m: float = RANGE_M) -> dict:
+               range_m: float = RANGE_M,
+               eye_m: float = EYE_HEIGHT_M) -> dict:
     """V at (lat, lon), with the breakdown the viewer's score panel shows.
 
     The point is used as given: callers that want the snapped summit should
@@ -154,7 +156,7 @@ def view_score(dem_path: Path, landcover_path: Path | None,
     if not bool(gok[0]):
         raise ValueError("viewpoint is outside the DEM or on a void")
     ground = float(gz[0])
-    eye_z = ground + EYE_HEIGHT_M
+    eye_z = ground + eye_m
 
     # ray geometry: azimuths x distances
     az = np.arange(n_az) * (360.0 / n_az)
@@ -315,7 +317,7 @@ def view_score(dem_path: Path, landcover_path: Path | None,
 
     return {
         "lat": lat, "lon": lon,
-        "ground_m": round(ground, 1), "eye_m": EYE_HEIGHT_M,
+        "ground_m": round(ground, 1), "eye_m": eye_m,
         "V": V, "units": "sr·km",
         "params": {
             "gamma": gamma, "d_haze_km": D_HAZE_M / 1000.0,

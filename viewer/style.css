@@ -216,26 +216,34 @@ html, body {
   letter-spacing: .09em;
   color: var(--muted);
 }
-.ins-feature {
-  margin-bottom: 5px;
-  padding-left: 7px;
-  border-left: 2px solid var(--line);
-}
-.ins-feature .ft {
+/* ---- feature hover card ----
+   Follows the pointer (placeHoverCard) and never takes the mouse, so it
+   cannot steal the hover from the feature it describes. */
+#hovercard {
+  position: fixed;
+  z-index: 1300;
+  pointer-events: none;
+  max-width: 260px;
+  min-width: 150px;
+  background: rgba(20,23,26,.97);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 9px 6px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.45);
   font-size: 11.5px;
-  display: flex;
-  align-items: center;
-  gap: 5px;
 }
-.ins-feature .ft i {
-  width: 8px; height: 8px; border-radius: 2px; flex: none;
-}
-.ins-feature .fsub {
-  font-size: 10.5px;
-  color: var(--muted);
-  margin-left: 13px;
-  word-break: break-word;
-}
+#hovercard[hidden] { display: none; }
+.hc-head { display: flex; align-items: center; gap: 6px; }
+.hc-head i { width: 9px; height: 9px; border-radius: 2px; flex: none;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.2); }
+.hc-head b { font-size: 12.5px; font-weight: 600; color: var(--text); }
+.hc-sub { color: var(--muted); font-size: 10.5px; margin: 1px 0 4px 15px; }
+.hc-row { display: flex; justify-content: space-between; gap: 10px;
+  padding: 1px 0; font-variant-numeric: tabular-nums; }
+.hc-row .k { color: var(--muted); }
+.hc-row .v { text-align: right; }
+.hc-foot { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--line);
+  color: #5c6672; font-size: 10px; }
 
 /* ---- viewpoint tool ---- */
 .tool-hint { margin: 0; font-size: 10.5px; color: var(--muted); }
@@ -583,6 +591,8 @@ body.pano-resizing { cursor: ns-resize; user-select: none; }
   font-variant-numeric: tabular-nums;
 }
 #vscore[hidden] { display: none; }
+/* the camera has moved and the score is being recomputed for the new spot */
+#vscore.stale #vs-value, #vscore.stale #vs-body { opacity: .45; transition: opacity .15s; }
 #vscore header { display: flex; align-items: center; gap: 8px; }
 #vscore h2 {
   flex: 1;
@@ -609,6 +619,14 @@ body.pano-resizing { cursor: ns-resize; user-select: none; }
 .vs-unit { font-size: 12px; color: var(--muted); }
 #vs-state { margin-left: auto; font-size: 11px; color: var(--muted); }
 .vs-formula { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+/* V at the eye slider's height: a comparison, so set below the real score */
+#vs-alt { display: flex; justify-content: space-between; gap: 8px;
+  font-size: 11.5px; margin: 0 0 4px; }
+#vs-alt[hidden] { display: none; }
+#vs-alt .k { color: var(--muted); }
+#vs-alt .v b { font-weight: 600; }
+#vs-alt .v small { color: var(--muted); font-size: 10.5px; }
+#vs-alt.stale, #vscore.stale #vs-alt { opacity: .45; }
 .vs-formula sup { font-size: 8px; }
 .vs-sec { border-top: 1px solid var(--line); padding-top: 7px; margin-top: 7px; }
 .vs-sec h3 {

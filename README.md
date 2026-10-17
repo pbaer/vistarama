@@ -126,6 +126,12 @@ opens at the bottom with a WebGL rendering of the surrounding terrain.
   on the panorama, and the map's cursor card gives distance and bearing from
   the viewpoint. Drag the pane's top edge to resize it.
 
+On the map itself, hovering a trail, road, lake, peak or other feature
+highlights it and shows a card beside the cursor with its name, type and the
+handful of tags worth knowing (difficulty and surface for trails, elevation for
+peaks, and so on). The "At cursor" card in the corner sticks to the raster
+values under the pointer.
+
 This shares the geometry the view score `V` needs, so it doubles as a visual
 check on that machinery before the metric is wired up.
 
@@ -346,7 +352,7 @@ earns nothing.
 | `γ` | 1.0 | the doc's starting value; tune within 0.8–1.3 |
 | `w(d)` near cutoff | 300 m | the doc |
 | `w(d)` haze taper | `exp(−d / 60 km)` | the doc; independent of the panorama's haze slider |
-| eye height | 2 m | fixed, so scores compare between points |
+| eye height | 2 m | fixed, so scores compare between points; the panel adds V at the slider's height as a comparison |
 | `c` snow and ice, bare / sparse, water | 1.0 | the doc's "high" group |
 | `c` moss and lichen | 0.8 | "medium-high" |
 | `c` grassland, shrubland, wetland | 0.6 | "medium" |
@@ -358,7 +364,21 @@ Ray count barely matters. Against a 2880-ray, 15 m-step reference at four
 test points, 360 rays land within 1.2% and 720 within 0.6%. Halving the step
 moves V by a steady 0.4%; doubling it to 60 m costs up to 3.5%.
 
-The panel opens beside the map whenever a panorama loads. It shows:
+The panel opens beside the map whenever a panorama loads. Walking the camera
+with WASD or the arrow keys rescores wherever it ends up: the panel dims as
+soon as you move and recomputes 0.5 s after the last movement key is
+released, with the distance moved in its header. Recent points are cached, so
+`0` brings the original score straight back.
+
+The score is always taken at a standing 2 m. When the eye slider is set
+anywhere else, a second line under it gives V for the same spot at the slider's
+height and the change against 2 m, to show how much a viewpoint gains from
+height. It is fetched after the 2 m score lands, recomputed 0.5 s after the
+slider stops, and never replaces the real score. From Colchuck Lake's shore,
+for example, 205 m of height doubles V (1.56 → 3.12); from Stuart's summit,
+where nothing nearby blocks the view, 200 m adds only 28%.
+
+The panel shows:
 
 - **The terms, summarised:** visible solid angle, its median distance, `dᵞ`
   there, the mean `c`, the haze factor, and the same sum at `γ = 0`
@@ -591,8 +611,28 @@ Each of these produced a plausible-looking but wrong result:
   either end). Recovering these took water areas from 3023 → 3635 features and
   protected areas from 46 → 165.
 - **Leaflet's default hit tolerance is 0**, so a 1 px line is hittable only
-  within half its own width. Hover and tooltips both depend on it; set
+  within half its own width. The hover highlight and card depend on it; set
   `tolerance` on the renderer (`L.canvas({tolerance: 12})`).
+- **A memo key has to cover every input, including the ones that rarely
+  change.** The panorama caches its camera matrices by yaw, pitch, fov, eye
+  height, camera offset and canvas size. The eye's altitude is the mesh's
+  ground height plus eye height, and the mesh was not in the key, so picking
+  a new viewpoint without touching the view reused the old matrices: after
+  Stuart's summit the camera stayed at 2,972 m for every later point, 1.2 km
+  in the air over the Icicle valley. The key now carries a counter bumped on
+  every mesh load, which also catches the far plane after a range change.
+- **A second Leaflet canvas renderer blocks the first one's hover.** Each
+  canvas renderer is its own `<canvas>` element, and the browser sends the
+  mouse to whichever is on top. The panorama's view wedge has its own canvas
+  (so redrawing it does not repaint 100k roads), and in the shared overlay
+  pane it sat above the feature canvas: from the moment a panorama opened,
+  feature hover silently stopped. It now lives in its own pane with
+  `pointer-events: none`, which is safe because nothing on it is interactive.
+- **Don't `bringToFront` a hovered feature on a shared canvas.** It moves the
+  layer to the end of the renderer's draw list for good, not just while
+  hovered: a lake hovered once then covers every trail crossing it. The hover
+  highlight changes stroke width and symbol size in place and restores them
+  on mouseout.
 - **`~transform * (x, y)` returns fractional cell coordinates with integers at
   cell *corners*, so the containing cell is `floor`, not `round`.** Using
   `round`/`np.rint` offsets every sample by half a cell (15 m at 30 m
