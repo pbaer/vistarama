@@ -534,6 +534,13 @@ function styleFor(theme, props) {
 
 const HOVER_WEIGHT_ADD = 2;       // px added to a hovered path's stroke
 const HOVER_RADIUS_MUL = 1.45;    // a hovered point symbol grows by this
+// A trail OSM splits into several ways is highlighted whole, every way alike.
+// The ranked list marks its selection in a colour no other line uses.
+const SELECT_COLOR = '#ffc23d';
+
+// trail id -> every loaded tile layer of that trail. A way that spans several
+// grid cells is loaded once per cell, and all copies are highlighted.
+const trailLayers = new Map();
 const HOVER_CARD_GAP = 14;        // px between the cursor and the card
 
 const SAC_LABEL = {
@@ -549,7 +556,189 @@ const VISIBILITY_LABEL = {
   bad: 'hard to follow', horrible: 'barely visible', no: 'no trail',
 };
 
-let hovered = null;               // { layer, base }
+let hovered = null;               // { layer, base, theme }
+
+// ---- stored view scores for trails, peaks and passes ----------------------
+//
+// Hover one of these and press V: the server scores it (averaged every 50 m
+// along a trail, at the summit for a peak, at the node for a pass; see
+// scripts/featurescore.py) and stores the result keyed by OSM id. Stored
+// scores are loaded once at start-up and shown in the hover card from then
+// on, across reloads. The server drops any score computed under another
+// version of the method, so what arrives here is always current.
+const SCORABLE_THEMES = new Set(['trails', 'peaks', 'passes']);
+const FS_POLL_MS = 500;
+const featureScores = new Map();   // OSM id -> stored score summary
+const featureJobs = new Map();     // OSM id -> { state, done, total, error }
+
+async function loadFeatureScores() {
+  try {
+    const r = await fetch(`/api/feature_scores?slug=${AOI}`);
+    if (!r.ok) return;
+    const data = await r.json();
+    // each record once (the ranked list), and every OSM way or node id
+    // mapped to its record (the hover card)
+    featureItems.clear();
+    for (const [key, rec] of Object.entries(data.items || {})) featureItems.set(key, rec);
+    for (const [id, key] of Object.entries(data.ids || {})) {
+      const rec = data.items[key];
+      if (rec) featureScores.set(id, rec);
+    }
+  } catch (err) { /* server without the endpoint: cards just offer V */ }
+}
+
+/** Re-render the card if `fid` is the feature under the cursor. */
+function refreshHoverCardFor(fid) {
+  if (!hovered || !hovered.layer.feature || hovered.layer.feature.id !== fid) return;
+  renderHoverCard(hovered.theme, hovered.layer.feature);
+  showBestPoint(hovered.layer.feature);
+  // new content changes the card's size, so find it a spot again
+  if (!hovered.follow) hovered.follow = !placeHoverCardFor(hovered.layer, hovered.theme);
+}
+
+// The highest-V samples of a scored trail, marked while the trail is hovered:
+// white dots labelled with their V. A single-way trail gets its best point;
+// a multi-way trail gets every way's best, the trail's own best among them.
+// They sit on the mouse-transparent overlay pane, as the view wedge does, so
+// they can never take the hover away from the trail they belong to, and the
+// labels are tooltips, which Leaflet already keeps out of the pointer's way.
+// Labels are placed highest V first, each on the first side of its dot that
+// does not cover a label already placed; one with no free side is left off
+// and its dot stands alone.
+let bestPoint = null;              // [layer, ...] currently on the map
+const BEST_LABEL_SIDES = [['top', [0, -8]], ['bottom', [0, 8]],
+  ['right', [8, 0]], ['left', [-8, 0]]];
+
+/** The points to mark: every way's best on a multi-way trail, else the
+ *  trail's. Per-way bests come from the stored samples, rounded to 6
+ *  decimals, so points within 2e-6 deg are one point. */
+function bestPoints(rec) {
+  const pts = rec.way_stats ? Object.values(rec.way_stats).map((w) => w.best) : [];
+  if (!pts.length) pts.push(rec.best);
+  const out = [];
+  for (const p of pts.sort((a, b) => b.V - a.V)) {
+    const dup = out.some((q) => Math.abs(q.lat - p.lat) < 2e-6 && Math.abs(q.lon - p.lon) < 2e-6);
+    if (!dup) out.push(p);
+  }
+  return out;
+}
+
+function showBestPoint(feature) {
+  hideBestPoint();
+  const rec = feature && feature.id && featureScores.get(feature.id);
+  if (!rec || rec.kind !== 'line' || !rec.best) return;
+  bestPoint = [];
+  const placed = [];
+  for (const p of bestPoints(rec)) {
+    const at = [p.lat, p.lon];
+    bestPoint.push(L.circleMarker(at, {
+      renderer: panoOverlayRenderer, interactive: false, radius: 6,
+      color: '#11141a', weight: 2, fillColor: '#ffffff', fillOpacity: 1,
+    }).addTo(map));
+    for (const [direction, offset] of BEST_LABEL_SIDES) {
+      const label = L.tooltip({ permanent: true, direction, offset, className: 'best-tip' })
+        .setLatLng(at).setContent(vsFmt(p.V)).addTo(map);
+      const r = label.getElement().getBoundingClientRect();
+      if (!placed.some((o) => r.left < o.right + 2 && r.right > o.left - 2
+          && r.top < o.bottom + 2 && r.bottom > o.top - 2)) {
+        placed.push(r);
+        bestPoint.push(label);
+        break;
+      }
+      map.removeLayer(label);
+    }
+  }
+}
+
+function hideBestPoint() {
+  if (!bestPoint) return;
+  for (const l of bestPoint) map.removeLayer(l);
+  bestPoint = null;
+}
+
+async function scoreFeature(theme, fid) {
+  const cur = featureJobs.get(fid);
+  if (featureScores.has(fid) || (cur && cur.state === 'running')) return;
+  const started = performance.now();
+  featureJobs.set(fid, { state: 'running', done: 0, total: null, started });
+  refreshHoverCardFor(fid);
+  try {
+    const r = await fetch('/api/feature_score', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slug: AOI, theme, id: fid }),
+    });
+    let st = await r.json();
+    if (!r.ok) throw new Error(st.error || `HTTP ${r.status}`);
+    while (st.state === 'running') {
+      featureJobs.set(fid, { state: 'running', done: st.done || 0, total: st.total, started });
+      refreshHoverCardFor(fid);
+      await new Promise((res) => setTimeout(res, FS_POLL_MS));
+      const q = await fetch(`/api/feature_score_job?job=${st.job}`);
+      st = await q.json();
+      if (!q.ok) throw new Error(st.error || `HTTP ${q.status}`);
+    }
+    if (st.state === 'error') throw new Error(st.error);
+    // every way of the trail shares the score; the tiles only know way ids
+    featureScores.set(fid, st.record);
+    for (const wid of st.record.ways || []) featureScores.set(wid, st.record);
+    featureItems.set(st.record.id, st.record);
+    featureJobs.delete(fid);
+    renderRank();
+  } catch (err) {
+    featureJobs.set(fid, { state: 'error', error: err.message });
+  }
+  refreshHoverCardFor(fid);
+}
+
+/** The card's view-score rows for a scorable feature. */
+function scoreRows(fid) {
+  const rows = [];
+  const rec = featureScores.get(fid);
+  const job = featureJobs.get(fid);
+  if (rec) {
+    if (rec.kind === 'line') {
+      // the trail's average, and on a multi-way trail the hovered way's own;
+      // the best points are marked on the map, so they are not repeated here
+      const seg = rec.n_ways > 1 && rec.way_stats && rec.way_stats[fid];
+      rows.push(['View score', seg
+        ? `${vsFmt(rec.V)} avg · segment ${vsFmt(seg.V)}`
+        : `${vsFmt(rec.V)}${rec.n > 1 ? ' avg' : ''}`, true]);
+    } else {
+      rows.push(['View score', vsFmt(rec.V), true]);
+    }
+  } else if (job && job.state === 'running') {
+    let txt = 'starting…';
+    if (job.total) {
+      txt = `computing ${job.done}/${job.total}`;
+      // time left from the rate so far, once there is a rate to go on
+      if (job.done >= 3) {
+        const left = (performance.now() - job.started) / job.done * (job.total - job.done) / 1000;
+        txt += left >= 90 ? ` · ~${Math.round(left / 60)} min left` : ` · ~${Math.max(1, Math.round(left))} s left`;
+      } else {
+        txt += '…';
+      }
+    }
+    rows.push(['View score', txt, true]);
+  } else if (job && job.state === 'error') {
+    rows.push(['View score', `failed: ${job.error}`, true]);
+  } else {
+    rows.push(['View score', 'press V', true]);
+  }
+  return rows;
+}
+
+document.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'v' && ev.key !== 'V') return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
+  const t = ev.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  if (!hovered || !SCORABLE_THEMES.has(hovered.theme) || $('hovercard').hidden) return;
+  const fid = hovered.layer.feature && hovered.layer.feature.id;
+  if (!fid) return;
+  ev.preventDefault();
+  scoreFeature(hovered.theme, fid);
+});
 
 /** Tag values read better without OSM's underscores. */
 const tagText = (v) => String(v).replace(/_/g, ' ');
@@ -621,7 +810,19 @@ function hoverFacts(theme, p) {
   return f;
 }
 
-function renderHoverCard(theme, props) {
+/** Length rows for a trail way: the segment and, when OSM splits the trail
+ *  into several ways, the whole trail. Both come from the tile, measured on
+ *  the raw geometry by process.py. */
+function trailLengthRows(f) {
+  if (!f || f.len === undefined) return [];
+  if (!f.trail) return [['Length', formatDistance(f.len)]];
+  return [['Length', `${formatDistance(f.len)} of ${formatDistance(f.trail_len)}`
+    + ` (${f.trail_n} segments)`]];
+}
+
+function renderHoverCard(theme, feature) {
+  const props = (feature && feature.properties) || {};
+  const fid = feature && feature.id;
   const s = VECTOR_STYLE[theme];
   const c = classOf(theme, props);
   const card = $('hovercard');
@@ -635,7 +836,9 @@ function renderHoverCard(theme, props) {
   const sub = el('div', 'hc-sub');
   sub.textContent = props.name && c.label !== s.label ? `${c.label} · ${s.label}` : s.label;
   card.append(head, sub);
-  for (const [k, v] of hoverFacts(theme, props)) {
+  const facts = hoverFacts(theme, props);
+  if (theme === 'trails') facts.push(...trailLengthRows(feature));
+  for (const [k, v] of facts) {
     const row = el('div', 'hc-row');
     const kk = el('span', 'k');
     kk.textContent = k;
@@ -644,8 +847,21 @@ function renderHoverCard(theme, props) {
     row.append(kk, vv);
     card.appendChild(row);
   }
+  const scorable = SCORABLE_THEMES.has(theme) && fid;
+  if (scorable) {
+    scoreRows(fid).forEach(([k, v, main], i) => {
+      const row = el('div', `hc-row hc-score${i === 0 ? ' first' : ''}`);
+      const kk = el('span', 'k');
+      kk.textContent = k;
+      const vv = el('span', main ? 'v main' : 'v');
+      vv.textContent = v;
+      row.append(kk, vv);
+      card.appendChild(row);
+    });
+  }
   const foot = el('div', 'hc-foot');
-  foot.textContent = 'Alt-click for all tags';
+  foot.textContent = scorable && !featureScores.has(fid)
+    ? 'V: view score · Alt-click for all tags' : 'Alt-click for all tags';
   card.appendChild(foot);
   card.hidden = false;
 }
@@ -663,36 +879,249 @@ function placeHoverCard(clientX, clientY) {
   card.style.top = `${Math.max(4, y)}px`;
 }
 
+// ---- where the hover card goes --------------------------------------------
+//
+// Following the cursor put the card right over whatever was next to the
+// feature, often the rest of the trail. For a line (a trail, road or river)
+// the card is instead placed once, beside the middle of the hovered way's
+// visible part: the nearest spot, searched outward in every direction, that
+// stays inside the visible map and keeps HOVER_CARD_BUFFER px clear of the
+// way, of the best-V dots and their labels, and of the panels floating over
+// the map. It first tries to stay clear of the whole trail too, within
+// HOVER_CARD_TRAIL_SLACK px of extra distance, else just the hovered way.
+// A point gets the same search around itself. An area, or a line with nowhere
+// free, falls back to following the cursor.
+
+const HOVER_CARD_BUFFER = 14;      // px clear of the feature and other obstacles
+const HOVER_CARD_DIRS = 16;        // directions tried around the anchor
+const HOVER_CARD_STEP = 12;        // px between candidate distances
+const HOVER_CARD_MAX_D = 640;      // furthest a card may sit from its anchor
+// Clearing the whole trail is worth at most this much extra distance from the
+// hovered way; past it, staying near the way wins. Without a limit a short
+// segment in a tangle of trail sent the card 190 px away to a corner.
+const HOVER_CARD_TRAIL_SLACK = 80;
+const INSPECT_FULL_H = 280;        // the cursor card filled in: 200 px, ~260 with a viewpoint open
+
+/** The part of the map not covered by the side panels, in client pixels. */
+function visibleMapRect() {
+  const m = map.getContainer().getBoundingClientRect();
+  let l = m.left;
+  const panel = $('panel');
+  if (!panel.classList.contains('hidden')) l = Math.max(l, panel.getBoundingClientRect().right);
+  return { l: l + 4, t: m.top + 4, r: m.right - 4, b: m.bottom - 4 };
+}
+
+/** Rectangles the card must not cover: floating panels and best-V markers. */
+function cardObstacles() {
+  const out = [];
+  const add = (r, pad = 4) => {
+    if (r && r.width && r.height) {
+      out.push({ l: r.left - pad, t: r.top - pad, r: r.right + pad, b: r.bottom + pad });
+    }
+  };
+  for (const id of ['inspect', 'vscore', 'rank-toggle', 'panel-toggle']) {
+    const e = $(id);
+    if (!e || e.hidden || e.offsetParent === null) continue;
+    const r = e.getBoundingClientRect();
+    if (id === 'inspect') {
+      // The cursor card fills in a moment after the pointer moves (its
+      // lookup is debounced), so at placement time it is often still the
+      // one-line hint. Reserve the height it grows to, or the hover card
+      // lands where it is about to be.
+      add({ left: r.left, top: r.top, right: r.right, width: r.width,
+            bottom: r.top + Math.max(r.height, INSPECT_FULL_H), height: 1 });
+    } else {
+      add(r);
+    }
+  }
+  const mr = map.getContainer().getBoundingClientRect();
+  for (const l of bestPoint || []) {
+    if (l.getElement && l.getElement() && !(l instanceof L.CircleMarker)) {
+      add(l.getElement().getBoundingClientRect(), HOVER_CARD_BUFFER / 2);
+    } else if (l.getLatLng) {
+      const p = map.latLngToContainerPoint(l.getLatLng());
+      const r = 8 + HOVER_CARD_BUFFER / 2;
+      out.push({ l: mr.left + p.x - r, t: mr.top + p.y - r, r: mr.left + p.x + r, b: mr.top + p.y + r });
+    }
+  }
+  return out;
+}
+
+/** A layer's lines as client-pixel polylines. */
+function clientLines(layer) {
+  const mr = map.getContainer().getBoundingClientRect();
+  const ll = layer.getLatLngs();
+  const lines = ll.length && ll[0] instanceof L.LatLng ? [ll] : ll.flat(1);
+  return lines.map((line) => line.map((p) => {
+    const c = map.latLngToContainerPoint(p);
+    return [mr.left + c.x, mr.top + c.y];
+  }));
+}
+
+/** Segments [x1, y1, x2, y2] with their bounding boxes, for fast rejection. */
+function toSegments(lines) {
+  const out = [];
+  for (const line of lines) {
+    for (let i = 0; i + 1 < line.length; i++) {
+      const [x1, y1] = line[i], [x2, y2] = line[i + 1];
+      out.push([x1, y1, x2, y2, Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)]);
+    }
+  }
+  return out;
+}
+
+/** Whether a segment comes within `buf` of a rectangle. */
+function segNearRect(s, R, buf) {
+  const l = R.l - buf, t = R.t - buf, r = R.r + buf, b = R.b + buf;
+  if (s[6] < l || s[4] > r || s[7] < t || s[5] > b) return false;   // bbox miss
+  const inside = (x, y) => x >= l && x <= r && y >= t && y <= b;
+  if (inside(s[0], s[1]) || inside(s[2], s[3])) return true;
+  // otherwise it is near only if it crosses the expanded rectangle's edges
+  const cross = (ax, ay, bx, by, cx, cy, dx, dy) => {
+    const d = (bx - ax) * (dy - cy) - (by - ay) * (dx - cx);
+    if (!d) return false;
+    const u = ((cx - ax) * (dy - cy) - (cy - ay) * (dx - cx)) / d;
+    const v = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / d;
+    return u >= 0 && u <= 1 && v >= 0 && v <= 1;
+  };
+  const [x1, y1, x2, y2] = s;
+  return cross(x1, y1, x2, y2, l, t, r, t) || cross(x1, y1, x2, y2, r, t, r, b)
+    || cross(x1, y1, x2, y2, l, b, r, b) || cross(x1, y1, x2, y2, l, t, l, b);
+}
+
+/** The point halfway along the part of the lines inside `vis`. */
+function visibleMidpoint(lines, vis) {
+  const inV = (p) => p[0] >= vis.l && p[0] <= vis.r && p[1] >= vis.t && p[1] <= vis.b;
+  const segs = [];
+  let total = 0;
+  for (const line of lines) {
+    for (let i = 0; i + 1 < line.length; i++) {
+      if (!inV(line[i]) || !inV(line[i + 1])) continue;
+      const len = Math.hypot(line[i + 1][0] - line[i][0], line[i + 1][1] - line[i][1]);
+      segs.push([line[i], line[i + 1], len]);
+      total += len;
+    }
+  }
+  if (!segs.length) return null;
+  let acc = 0;
+  for (const [a, b, len] of segs) {
+    if (acc + len >= total / 2) {
+      const f = len ? (total / 2 - acc) / len : 0;
+      return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+    }
+    acc += len;
+  }
+  return segs[segs.length - 1][1];
+}
+
+/** The nearest free spot for a w x h card around `anchor`, or null. */
+function findCardSpot(anchor, w, h, segments, rects, vis, buf) {
+  const ok = (R) => {
+    if (R.l < vis.l || R.t < vis.t || R.r > vis.r || R.b > vis.b) return false;
+    for (const o of rects) if (R.l < o.r && R.r > o.l && R.t < o.b && R.b > o.t) return false;
+    for (const s of segments) if (segNearRect(s, R, buf)) return false;
+    return true;
+  };
+  for (let d = HOVER_CARD_STEP; d <= HOVER_CARD_MAX_D; d += HOVER_CARD_STEP) {
+    for (let k = 0; k < HOVER_CARD_DIRS; k++) {
+      const a = (k / HOVER_CARD_DIRS) * 2 * Math.PI;
+      // the card's nearest edge sits d from the anchor, along this direction
+      const cx = anchor[0] + Math.cos(a) * (d + w / 2);
+      const cy = anchor[1] + Math.sin(a) * (d + h / 2);
+      const R = { l: cx - w / 2, t: cy - h / 2, r: cx + w / 2, b: cy + h / 2, d };
+      if (ok(R)) return R;
+    }
+  }
+  return null;
+}
+
+/** Place the card for the hovered feature; false means "follow the cursor". */
+function placeHoverCardFor(layer, theme) {
+  const card = $('hovercard');
+  if (card.hidden) return false;
+  const w = card.offsetWidth, h = card.offsetHeight;
+  const vis = visibleMapRect();
+  const rects = cardObstacles();
+  let anchor = null;
+  const tiers = [];
+  if (layer.getLatLngs && !layer.options.fill) {
+    const own = toSegments(clientLines(layer));
+    anchor = visibleMidpoint(clientLines(layer), vis);
+    const trail = layer.feature && layer.feature.trail;
+    if (trail) {
+      const all = [];
+      for (const l of trailLayers.get(trail) || []) if (map.hasLayer(l)) all.push(...toSegments(clientLines(l)));
+      tiers.push(all);                  // clear of the whole trail, if it can be
+    }
+    tiers.push(own);                    // otherwise clear of the hovered way
+  } else if (layer.getLatLng) {
+    const mr = map.getContainer().getBoundingClientRect();
+    const p = map.latLngToContainerPoint(layer.getLatLng());
+    anchor = [mr.left + p.x, mr.top + p.y];
+    const r = (layer.getRadius ? layer.getRadius() : 6) + 2;
+    rects.push({ l: anchor[0] - r, t: anchor[1] - r, r: anchor[0] + r, b: anchor[1] + r });
+    tiers.push([]);
+  }
+  if (!anchor) return false;
+  // the buffer is a visible gap: measured from the line's edge, not its
+  // centre, so add half the drawn stroke (the hovered way is the widest)
+  const buf = HOVER_CARD_BUFFER + (layer.options.weight || 2) / 2;
+  const spots = tiers.map((segs) => findCardSpot(anchor, w, h, segs, rects, vis, buf));
+  let R = spots[0];
+  const near = spots[spots.length - 1];      // clear of the hovered way only
+  if (!R || (near && R.d > near.d + HOVER_CARD_TRAIL_SLACK)) R = near;
+  if (!R) return false;
+  card.style.left = `${Math.round(R.l)}px`;
+  card.style.top = `${Math.round(R.t)}px`;
+  return true;
+}
+
+const pathBase = (o) => ({ weight: o.weight, opacity: o.opacity,
+  fillOpacity: o.fillOpacity, color: o.color, dashArray: o.dashArray });
+
 function hoverStart(theme, layer, ev) {
   if (hovered && hovered.layer !== layer) hoverEnd();
   if (!hovered) {
     const o = layer.options;
     if (layer.setRadius) {
-      hovered = { layer, base: { radius: layer.getRadius(), weight: o.weight, color: o.color } };
+      hovered = { layer, theme, base: { radius: layer.getRadius(), weight: o.weight, color: o.color } };
       layer.setRadius(hovered.base.radius * HOVER_RADIUS_MUL);
       layer.setStyle({ weight: 2, color: '#ffffff' });
     } else {
-      hovered = { layer, base: { weight: o.weight, opacity: o.opacity, fillOpacity: o.fillOpacity } };
+      hovered = { layer, theme, base: pathBase(o), rest: [] };
       const st = { weight: (o.weight || 1) + HOVER_WEIGHT_ADD, opacity: 1 };
       if (o.fill) st.fillOpacity = Math.min(0.95, (o.fillOpacity ?? 0.5) + 0.15);
       layer.setStyle(st);
+      // the rest of a multi-way trail, drawn the same as the hovered way
+      const trail = layer.feature && layer.feature.trail;
+      for (const other of (trail && trailLayers.get(trail)) || []) {
+        if (other === layer) continue;
+        hovered.rest.push({ layer: other, base: pathBase(other.options) });
+        other.setStyle({ weight: (other.options.weight || 1) + HOVER_WEIGHT_ADD, opacity: 1 });
+      }
     }
   }
-  renderHoverCard(theme, (layer.feature && layer.feature.properties) || {});
-  if (ev && ev.originalEvent) placeHoverCard(ev.originalEvent.clientX, ev.originalEvent.clientY);
+  renderHoverCard(theme, layer.feature);
+  if (theme === 'trails') showBestPoint(layer.feature);
+  hovered.follow = !placeHoverCardFor(layer, theme);
+  if (hovered.follow && ev && ev.originalEvent) {
+    placeHoverCard(ev.originalEvent.clientX, ev.originalEvent.clientY);
+  }
 }
 
 function hoverEnd(layer) {
   if (!hovered || (layer && hovered.layer !== layer)) return;
-  const { layer: l, base } = hovered;
+  const { layer: l, base, rest } = hovered;
   if (l.setRadius) {
     l.setRadius(base.radius);
     l.setStyle({ weight: base.weight, color: base.color });
   } else {
     l.setStyle(base);
   }
+  for (const r of rest || []) r.layer.setStyle(r.base);
   hovered = null;
   $('hovercard').hidden = true;
+  hideBestPoint();
 }
 
 function makeGeoJsonLayer(theme, data) {
@@ -728,6 +1157,18 @@ function makeGeoJsonLayer(theme, data) {
       lyr.on('mouseout', () => hoverEnd(lyr));
       // a chunk swapped out for another LOD tier never sends mouseout
       lyr.on('remove', () => hoverEnd(lyr));
+      // a selected trail in the ranked list stays marked as its tiles reload
+      if (theme === 'trails') lyr.on('add', () => markRankTrailLayer(lyr));
+      if (f.trail) {
+        lyr.on('add', () => {
+          if (!trailLayers.has(f.trail)) trailLayers.set(f.trail, new Set());
+          trailLayers.get(f.trail).add(lyr);
+        });
+        lyr.on('remove', () => {
+          const set = trailLayers.get(f.trail);
+          if (set) { set.delete(lyr); if (!set.size) trailLayers.delete(f.trail); }
+        });
+      }
     },
   };
   // L.GeoJSON applies `style` to every layer exposing setStyle(), which
@@ -854,6 +1295,7 @@ function buildVectors(vlayers) {
       currentTier: null,
       cellCount: 0,
       enabled: DEFAULT_VECTORS_ON.includes(theme),
+      cb: null,           // its checkbox, so the ranked list can switch it on
     };
 
     const maxFeatures = Math.max(...tiers.map((t) => t.features));
@@ -862,6 +1304,7 @@ function buildVectors(vlayers) {
     const cb = el('input');
     cb.type = 'checkbox';
     cb.checked = vectorLayers[theme].enabled;
+    vectorLayers[theme].cb = cb;
     const sw = el('span', 'swatch');
     sw.style.background = s.color;
     sw.style.borderColor = s.color;
@@ -1149,7 +1592,7 @@ map.on('mousemove', (ev) => {
   // not debounced: this is pure arithmetic against data already in memory, and
   // a laggy dot would defeat the point of the pairing
   showMapCursorOnPano(ev.latlng);
-  if (hovered) placeHoverCard(ev.originalEvent.clientX, ev.originalEvent.clientY);
+  if (hovered && hovered.follow) placeHoverCard(ev.originalEvent.clientX, ev.originalEvent.clientY);
 });
 map.on('mouseout', () => { showMapCursorOnPano(null); hoverEnd(); });
 // the feature under a still cursor changes when the map moves under it
@@ -1200,23 +1643,45 @@ function destPoint(lat, lon, bearingDeg, distM) {
   return [p2 * 180 / Math.PI, ((l2 * 180 / Math.PI + 540) % 360) - 180];
 }
 
-/** Draw where the panorama camera is looking, as a wedge on the map. */
+/** Make the map's viewpoint wherever the panorama camera now stands.
+ *
+ *  Walking with WASD moves the camera off the mesh centre. As far as the map
+ *  is concerned that is the same as having clicked there: the marker moves,
+ *  the wedge starts from it, the cursor card measures from it, and a range
+ *  change rebuilds the panorama there. The leader line from a click to the
+ *  summit it snapped to belongs to the original click, so it shows only
+ *  while the camera is back on that summit. */
+function syncViewpointToCamera(c) {
+  panoLatLng = L.latLng(c.lat, c.lon);
+  if (panoMarker) panoMarker.setLatLng(panoLatLng);
+  if (panoSnapLine) {
+    const show = c.moved < 0.5;
+    if (show && !map.hasLayer(panoSnapLine)) panoSnapLine.addTo(map);
+    else if (!show && map.hasLayer(panoSnapLine)) map.removeLayer(panoSnapLine);
+  }
+}
+
+/** Draw where the panorama camera is looking, as a wedge on the map, from
+ *  where the camera stands. */
 function updatePanoFovOnMap(p) {
   if (!p || !p.data) return;
   const h = p.data.header;
+  const c = cameraLatLng(p);
   // the camera's vertical fov is the parameter; the wedge needs horizontal
   const hfov = panoHfovDeg(p);
-  const key = `${p.yaw.toFixed(1)}|${hfov.toFixed(1)}|${h.range_km}|${h.lat}`;
+  const key = `${p.yaw.toFixed(1)}|${hfov.toFixed(1)}|${h.range_km}`
+    + `|${c.lat.toFixed(6)}|${c.lon.toFixed(6)}`;
   if (key === panoFovKey) return;         // nothing moved; skip the redraw
   panoFovKey = key;
+  syncViewpointToCamera(c);
 
   const R = h.range_km * 1000;
-  const pts = [[h.lat, h.lon]];
+  const pts = [[c.lat, c.lon]];
   const n = 24;
   for (let i = 0; i <= n; i++) {
-    pts.push(destPoint(h.lat, h.lon, p.yaw - hfov / 2 + hfov * i / n, R));
+    pts.push(destPoint(c.lat, c.lon, p.yaw - hfov / 2 + hfov * i / n, R));
   }
-  const axis = [[h.lat, h.lon], destPoint(h.lat, h.lon, p.yaw, R)];
+  const axis = [[c.lat, c.lon], destPoint(c.lat, c.lon, p.yaw, R)];
 
   if (!panoFov) {
     // The wedge competes with hillshade, imagery and a dense trail network, so
@@ -1246,10 +1711,11 @@ function updatePanoFovOnMap(p) {
 }
 
 // The map indicator is a *consequence* of the panorama view, not part of
-// drawing it, so it no longer runs inline with the render loop. A trailing
-// timer means a drag or a zoom updates the map once when it settles instead of
-// once per frame. Leading edge fires immediately so a single arrow tap still
-// feels instant.
+// drawing it, so it does not run inline with the render loop. It is
+// throttled: at most once per MAP_SYNC_IDLE_MS, the first change drawn at
+// once so a single arrow tap feels instant, and the last one always drawn.
+// A throttle rather than a debounce, so the viewpoint marker and wedge
+// follow the camera during a WASD walk instead of jumping when it stops.
 const MAP_SYNC_IDLE_MS = 100;
 let mapSyncTimer = null;
 let mapSyncLast = 0;
@@ -1257,19 +1723,23 @@ let mapSyncLast = 0;
 function scheduleMapSync(p) {
   const now = performance.now();
   if (now - mapSyncLast > MAP_SYNC_IDLE_MS) {   // idle: update straight away
+    clearTimeout(mapSyncTimer);
+    mapSyncTimer = null;
     mapSyncLast = now;
     updatePanoFovOnMap(p);
     return;
   }
-  clearTimeout(mapSyncTimer);
+  if (mapSyncTimer) return;                     // one is already due
   mapSyncTimer = setTimeout(() => {
+    mapSyncTimer = null;
     mapSyncLast = performance.now();
     if (pano && !$('pano').hidden) updatePanoFovOnMap(pano);
-  }, MAP_SYNC_IDLE_MS);
+  }, MAP_SYNC_IDLE_MS - (now - mapSyncLast));
 }
 
 function clearPanoFovOnMap() {
   clearTimeout(mapSyncTimer);
+  mapSyncTimer = null;
   if (panoFovCasing) { map.removeLayer(panoFovCasing); panoFovCasing = null; }
   if (panoFov) { map.removeLayer(panoFov); panoFov = null; }
   if (panoAxis) { map.removeLayer(panoAxis); panoAxis = null; }
@@ -1475,9 +1945,12 @@ function showPanoCursorOnMap(hit) {
     if (panoCursorMarker) { map.removeLayer(panoCursorMarker); panoCursorMarker = null; }
     return;
   }
+  // pickGround measures from the mesh centre, so that places the dot; the
+  // label is measured from the viewpoint, which walks with the camera
   const h = pano.data.header;
   const p = destPoint(h.lat, h.lon, hit.az, hit.dist);
   const ll = L.latLng(p[0], p[1]);
+  const from = geoInverse(panoLatLng, ll);
   if (!panoCursorMarker) {
     panoCursorMarker = L.circleMarker(ll, {
       radius: 5, color: '#fff', weight: 2, opacity: 0.9,
@@ -1489,7 +1962,7 @@ function showPanoCursorOnMap(hit) {
   // setTooltipContent, not bindTooltip: this runs on every mousemove and
   // rebinding would leak a listener per frame
   panoCursorMarker.setTooltipContent(
-    `${(hit.dist / 1000).toFixed(1)} km · ${Math.round(hit.az)}°`);
+    `${(from.dist / 1000).toFixed(1)} km · ${Math.round(from.bearing) % 360}°`);
 }
 
 // hover a tick to name it, without permanently spending screen space on it
@@ -2004,6 +2477,7 @@ function renderViewScore(d) {
     vsRow('dᵞ at that distance', (vis.median_dist_km ** P.gamma).toFixed(2)),
     vsRow('Mean land-cover weight c', vis.mean_class_weight.toFixed(2)),
     vsRow('Haze factor w', `${vis.haze_factor.toFixed(2)} (V ${vsFmt(ax.v_no_haze)} without)`),
+    vsRow('Canopy factor T', `${vis.canopy_factor.toFixed(2)} (V ${vsFmt(ax.v_no_canopy)} without trees)`),
   );
   const s1b = el('div', 'vs-note');
   s1b.textContent = 'The same sum at the two extremes of γ:';
@@ -2094,6 +2568,8 @@ function renderViewScore(d) {
     vsRow('γ, distance exponent', String(P.gamma)),
     vsRow('w(d): near cutoff', `${P.near_cutoff_m} m`),
     vsRow('w(d): haze taper exp(−d / dₕ)', `dₕ = ${P.d_haze_km} km`),
+    vsRow('T: canopy exp(−path in trees / λ)',
+      `λ = ${P.canopy_mfp_m} m, below ${P.canopy_h_m} m, first ${P.canopy_reach_m} m`),
     vsRow('Observer', `${d.ground_m} m ground + ${d.eye_m} m eye`),
     vsRow('March', `${P.n_az} rays × ${P.step_m} m to ${P.range_km} km`),
     vsRow('Curvature + refraction', `k = ${P.refraction_k}`),
@@ -2215,6 +2691,233 @@ try {
   }
 } catch (e) { /* storage unavailable: start expanded */ }
 
+// ---------------------------------------------------------------------------
+// Ranked list: every scored trail, peak and pass, sortable by V and by the
+// stats stored with it. Fed by /api/feature_scores (the same store the hover
+// card reads); while scripts/score_all.py runs, its status file is polled and
+// the list refills as chunks land. Selecting a row zooms the map to the item
+// and marks it until something else is selected.
+
+const RANK_PAGE = 200;             // rows rendered per "show more"
+const RANK_POLL_MS = 2000;         // while a bulk scoring job is running
+const RANK_IDLE_POLL_MS = 15000;   // otherwise, to notice a job started later
+const RANK_COLS = [
+  // key, header, title, value getter, formatter, numeric
+  ['name', 'Name', 'Name', (r) => r.name || '', null, false],
+  ['V', 'V', 'View score: the average along a trail, or at a peak or pass',
+    (r) => r.V, (v) => v.toFixed(2), true],
+  ['V_max', 'Best', 'Highest V anywhere along the trail',
+    (r) => (r.kind === 'line' ? r.V_max : null), (v) => v.toFixed(2), true],
+  ['length_m', 'Length', 'Trail length (whole trail)',
+    (r) => (r.kind === 'line' ? r.length_m : null),
+    (v) => (v >= 10000 ? `${(v / 1000).toFixed(0)} km` : `${(v / 1000).toFixed(1)} km`), true],
+  ['ele_min_m', 'Min', 'Lowest elevation, m',
+    (r) => r.ele_min_m, (v) => Math.round(v).toLocaleString(), true],
+  ['ele_max_m', 'Max', 'Highest elevation, m (a peak or pass: its elevation)',
+    (r) => r.ele_max_m, (v) => Math.round(v).toLocaleString(), true],
+  ['gain_m', 'Gain', 'Elevation gain, m, each segment walked in its uphill direction',
+    (r) => (r.kind === 'line' ? r.gain_m : null), (v) => Math.round(v).toLocaleString(), true],
+];
+const RANK_THEME_LABEL = { trails: 'trail', peaks: 'peak', passes: 'pass' };
+
+const featureItems = new Map();    // record key -> stored summary
+// Trails default to 1 km and up. Averaged V favours the very short: a 10 m
+// spur on a summit or a 100 m bootpath averages higher than any real trail,
+// and without a floor they fill the top of the list.
+const rankState = { type: 'trails', named: true, minLen: 1000, sort: 'V', dir: -1,
+  shown: RANK_PAGE };
+let rankSel = null;                // { key, theme, layers: [], marker }
+let rankLastUpdate = null;          // the status file's last write we acted on
+
+function rankRows() {
+  const col = RANK_COLS.find((c) => c[0] === rankState.sort);
+  const get = col[3];
+  const rows = [];
+  for (const r of featureItems.values()) {
+    if (rankState.type !== 'all' && r.theme !== rankState.type) continue;
+    if (rankState.named && !r.name) continue;
+    if (r.kind === 'line' && r.length_m < rankState.minLen) continue;
+    rows.push(r);
+  }
+  rows.sort((a, b) => {
+    const x = get(a), y = get(b);
+    // missing values always sink, whichever way the column is sorted
+    const xm = x === null || x === undefined || x === '';
+    const ym = y === null || y === undefined || y === '';
+    if (xm || ym) return xm === ym ? 0 : (xm ? 1 : -1);
+    if (col[5]) return (x - y) * rankState.dir;
+    return String(x).localeCompare(String(y)) * rankState.dir;
+  });
+  return rows;
+}
+
+function renderRank() {
+  const box = $('rank');
+  if (!box || box.hidden) return;
+  const rows = rankRows();
+  const head = $('rank-table').tHead;
+  head.replaceChildren();
+  const hr = el('tr');
+  hr.appendChild(el('th', 'num', '#'));
+  for (const [key, label, title] of RANK_COLS) {
+    const th = el('th', key === 'name' ? 'name' : 'num');
+    th.textContent = label + (rankState.sort === key ? (rankState.dir < 0 ? ' ▾' : ' ▴') : '');
+    th.title = `${title}. Click to sort.`;
+    th.classList.toggle('sorted', rankState.sort === key);
+    th.addEventListener('click', () => {
+      if (rankState.sort === key) rankState.dir = -rankState.dir;
+      else {
+        rankState.sort = key;
+        rankState.dir = RANK_COLS.find((c) => c[0] === key)[5] ? -1 : 1;
+      }
+      rankState.shown = RANK_PAGE;
+      renderRank();
+    });
+    hr.appendChild(th);
+  }
+  head.appendChild(hr);
+
+  const body = $('rank-table').tBodies[0];
+  body.replaceChildren();
+  rows.slice(0, rankState.shown).forEach((r, i) => {
+    const tr = el('tr');
+    tr.dataset.key = r.id;
+    if (rankSel && rankSel.key === r.id) tr.classList.add('sel');
+    const n = el('td', 'num rank-n');
+    n.textContent = String(i + 1);
+    tr.appendChild(n);
+    for (const [key, , , get, fmt] of RANK_COLS) {
+      const td = el('td', key === 'name' ? 'name' : 'num');
+      if (key === 'name') {
+        const sw = el('i', `rank-sw t-${r.theme}`);
+        td.appendChild(sw);
+        const nm = el('span');
+        nm.textContent = r.name || `unnamed ${RANK_THEME_LABEL[r.theme]}`;
+        td.appendChild(nm);
+        if (r.kind === 'line' && r.n_ways > 1) td.title = `${r.n_ways} OSM ways`;
+      } else {
+        const v = get(r);
+        td.textContent = v === null || v === undefined ? '' : fmt(v);
+      }
+      tr.appendChild(td);
+    }
+    tr.addEventListener('click', () => selectRankItem(r));
+    body.appendChild(tr);
+  });
+  const more = $('rank-more');
+  more.hidden = rows.length <= rankState.shown;
+  more.textContent = `Show ${Math.min(RANK_PAGE, rows.length - rankState.shown)} more`;
+  const kind = rankState.type === 'all' ? 'items' : rankState.type;
+  const minLen = rankState.minLen && rankState.type !== 'peaks' && rankState.type !== 'passes'
+    ? `, trails ≥ ${rankState.minLen / 1000} km` : '';
+  $('rank-count').textContent = `${rows.length.toLocaleString()} ${kind}`
+    + (rankState.named ? ', named only' : '') + minLen;
+}
+
+/** Restore the map styling of whatever is currently selected. */
+function clearRankSelection() {
+  if (!rankSel) return;
+  for (const l of rankSel.layers) {
+    if (map.hasLayer(l)) l.setStyle(styleFor('trails', l.feature.properties));
+  }
+  if (rankSel.marker) map.removeLayer(rankSel.marker);
+  rankSel = null;
+}
+
+const RANK_SEL_STYLE = (w) => ({ color: SELECT_COLOR, weight: (w || 1) + 3,
+  opacity: 1, dashArray: null });
+
+/** Mark a trail's layers as selected; called again as tiles load. */
+function markRankTrailLayer(lyr) {
+  if (!rankSel || rankSel.theme !== 'trails' || !lyr.feature) return;
+  const f = lyr.feature;
+  if (f.trail !== rankSel.key && f.id !== rankSel.key) return;
+  if (!rankSel.layers.includes(lyr)) rankSel.layers.push(lyr);
+  lyr.setStyle(RANK_SEL_STYLE(styleFor('trails', f.properties).weight));
+}
+
+function selectRankItem(r) {
+  clearRankSelection();
+  rankSel = { key: r.id, theme: r.theme, layers: [], marker: null };
+  // make sure the item's layer is on, or there is nothing to look at
+  const st = vectorLayers[r.theme];
+  if (st && !st.enabled && st.cb) { st.cb.checked = true; st.cb.dispatchEvent(new Event('change')); }
+  // The map runs underneath the left panel, so centre on the part of it that
+  // is actually visible: pad the fit by the panel's width on that side.
+  const panelW = $('panel').classList.contains('hidden') ? 0 : $('panel').getBoundingClientRect().width;
+  const fit = { paddingTopLeft: [panelW + 50, 50], paddingBottomRight: [50, 50] };
+  if (r.kind === 'line' && r.bbox) {
+    const [w, s, e, n] = r.bbox;
+    map.fitBounds([[s, w], [n, e]], { ...fit, maxZoom: 15 });
+    if (st) st.onMap.forEach((gj) => gj.eachLayer(markRankTrailLayer));
+  } else if (r.lat !== undefined) {
+    const z = Math.max(map.getZoom(), 14);
+    map.fitBounds(L.latLng(r.lat, r.lon).toBounds(1), { ...fit, maxZoom: z });
+    rankSel.marker = L.circleMarker([r.lat, r.lon], {
+      renderer: panoOverlayRenderer, interactive: false, radius: 12,
+      color: SELECT_COLOR, weight: 3, fill: false,
+    }).addTo(map);
+  }
+  renderRank();
+}
+
+async function pollScoreAll() {
+  let st;
+  try {
+    st = await (await fetch(`/api/score_all_status?slug=${AOI}`)).json();
+  } catch (err) {
+    setTimeout(pollScoreAll, RANK_IDLE_POLL_MS);
+    return;
+  }
+  const prog = $('rank-progress');
+  const running = ['planning', 'sampling', 'scoring'].includes(st.state);
+  if (running) {
+    const eta = st.eta_s !== undefined ? ` · ~${st.eta_s >= 90 ? `${Math.round(st.eta_s / 60)} min` : `${st.eta_s} s`} left` : '';
+    prog.textContent = st.state === 'scoring'
+      ? `Scoring: ${(st.items_done || 0).toLocaleString()} of ${(st.items_total || 0).toLocaleString()} items${eta}`
+      : `Scoring: ${st.state}…`;
+    prog.hidden = false;
+  } else {
+    prog.hidden = true;
+  }
+  // reload only when the job has written something new since last time
+  if (st.updated !== rankLastUpdate || rankLastUpdate === null) {
+    rankLastUpdate = st.updated;
+    await loadFeatureScores();
+    renderRank();
+  }
+  setTimeout(pollScoreAll, running ? RANK_POLL_MS : RANK_IDLE_POLL_MS);
+}
+
+function setRankVisible(on) {
+  $('rank').hidden = !on;
+  $('rank-toggle').hidden = on;
+  try { localStorage.setItem('rank-hidden', on ? '0' : '1'); } catch (e) { /* no storage */ }
+  syncLayoutVars();
+  if (on) renderRank();
+}
+
+$('rank-close').addEventListener('click', () => setRankVisible(false));
+$('rank-toggle').addEventListener('click', () => setRankVisible(true));
+$('rank-more').addEventListener('click', () => { rankState.shown += RANK_PAGE; renderRank(); });
+$('rank-minlen').addEventListener('change', (e) => {
+  rankState.minLen = +e.target.value; rankState.shown = RANK_PAGE; renderRank();
+});
+$('rank-named').addEventListener('change', (e) => {
+  rankState.named = e.target.checked; rankState.shown = RANK_PAGE; renderRank();
+});
+$('rank-type').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-type]');
+  if (!b) return;
+  rankState.type = b.dataset.type;
+  rankState.shown = RANK_PAGE;
+  for (const x of $('rank-type').querySelectorAll('button')) x.classList.toggle('on', x === b);
+  renderRank();
+});
+try {
+  if (localStorage.getItem('rank-hidden') === '1') { $('rank').hidden = true; $('rank-toggle').hidden = false; }
+} catch (e) { /* no storage: start shown */ }
+
 /** Publish the panel width and panorama height as CSS variables.
  *
  *  The panorama used to be `left: 0; bottom: 0` at z-index 1200, so it sat on
@@ -2231,9 +2934,12 @@ function syncLayoutVars() {
   const pw = panel.classList.contains('hidden')
     ? 0 : panel.getBoundingClientRect().width;
   const ph = pane.hidden ? 0 : pane.getBoundingClientRect().height;
+  const rank = $('rank');
+  const rw = !rank || rank.hidden ? 0 : rank.getBoundingClientRect().width;
   const root = document.documentElement.style;
   root.setProperty('--panel-w', `${Math.round(pw)}px`);
   root.setProperty('--pano-h', `${Math.round(ph)}px`);
+  root.setProperty('--rank-w', `${Math.round(rw)}px`);
   map.invalidateSize();
 }
 
@@ -2547,6 +3253,10 @@ map.on('moveend zoomend', () => {
   }
 
   CACHE_BUST = manifest.built ? `?v=${manifest.built}` : '';
+  // loads the stored scores, fills the ranked list, and keeps polling while
+  // a bulk scoring job is running
+  pollScoreAll();
+  syncLayoutVars();
 
   // Set the range slider from the constants rather than trusting the markup,
   // so the default cannot drift away from RANGE_MIN/MAX if either changes.

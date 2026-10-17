@@ -92,7 +92,10 @@ on an edge.
 Two masks, both buildable from data already on the basemap list — no new
 acquisitions.
 
-**Canopy gate.** ESA WorldCover's `Tree cover` class is binary at 10 m, but you
+**Canopy gate.** *As built, canopy is not a gate but occlusion inside `V`,
+per ray; see "Canopy occlusion" in
+[visibility-metric.md](visibility-metric.md). The density layer below is
+still computed and shown.* ESA WorldCover's `Tree cover` class is binary at 10 m, but you
 need *density* to threshold "heavily forested." Compute the tree-pixel fraction
 over a neighbourhood (say 300–500 m radius) from the binary layer. That yields
 a graded 0–1 canopy density from a free raster, with no separate canopy dataset.

@@ -55,6 +55,38 @@
 
   <div id="hovercard" hidden role="tooltip"></div>
 
+  <aside id="rank" aria-label="Ranked by view score">
+    <header>
+      <h2>Ranked by view score</h2>
+      <button id="rank-close" class="vs-toggle" title="Hide the list">✕</button>
+    </header>
+    <div id="rank-progress" hidden></div>
+    <div class="rank-filters">
+      <div id="rank-type" class="pano-seg" role="group" aria-label="Show">
+        <button data-type="trails" class="on">Trails</button>
+        <button data-type="peaks">Peaks</button>
+        <button data-type="passes">Passes</button>
+        <button data-type="all">All</button>
+      </div>
+      <label class="rank-named"><input type="checkbox" id="rank-named" checked> named only</label>
+      <label class="rank-named" title="Hide trails shorter than this">min
+        <select id="rank-minlen">
+          <option value="0">any</option>
+          <option value="500">0.5 km</option>
+          <option value="1000" selected>1 km</option>
+          <option value="3000">3 km</option>
+          <option value="10000">10 km</option>
+        </select>
+      </label>
+    </div>
+    <div id="rank-count"></div>
+    <div id="rank-wrap">
+      <table id="rank-table"><thead></thead><tbody></tbody></table>
+      <button id="rank-more" class="rank-more" hidden>Show more</button>
+    </div>
+  </aside>
+  <button id="rank-toggle" hidden title="Show the ranked list">Ranked list</button>
+
   <aside id="vscore" hidden aria-label="View score">
     <header>
       <h2>View score <span id="vs-where"></span></h2>

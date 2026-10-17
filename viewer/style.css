@@ -22,11 +22,11 @@ html, body {
    (syncLayoutVars): the panel's width and the panorama's total height. Both
    are 0 when the thing is hidden, so the same rules cover every combination
    without a class per state. */
-:root { --panel-w: 288px; --pano-h: 0px; }
+:root { --panel-w: 288px; --pano-h: 0px; --rank-w: 0px; }
 
 #map {
   position: absolute;
-  top: 0; left: 0; right: 0;
+  top: 0; left: 0; right: var(--rank-w);
   bottom: var(--pano-h);          /* stop above the panorama, not under it */
   background: #0d1013;
 }
@@ -165,7 +165,7 @@ html, body {
 /* ---- inspector card ---- */
 #inspect {
   position: absolute;
-  top: 10px; right: 10px;
+  top: 10px; right: calc(var(--rank-w) + 10px);
   z-index: 1000;
   width: 262px;
   max-height: calc(100% - 20px);
@@ -216,6 +216,84 @@ html, body {
   letter-spacing: .09em;
   color: var(--muted);
 }
+/* ---- ranked list ----
+   A column on the right, above the panorama like the map itself. */
+#rank {
+  position: absolute;
+  top: 0; right: 0; bottom: var(--pano-h);
+  width: 480px;
+  z-index: 1001;
+  display: flex; flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+#rank[hidden] { display: none; }
+#rank header { display: flex; align-items: center; padding: 10px 12px 6px; }
+#rank h2 {
+  flex: 1; margin: 0; font-size: 10px; font-weight: 600; letter-spacing: .09em;
+  text-transform: uppercase; color: var(--muted);
+}
+#rank-progress {
+  margin: 0 12px 6px; padding: 5px 8px; border-radius: 5px;
+  background: var(--panel-2); font-size: 11px; color: var(--text);
+}
+#rank-progress[hidden] { display: none; }
+.rank-filters { display: flex; align-items: center; gap: 10px; padding: 0 12px 6px; }
+.rank-named { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+.rank-named input { margin: 0; accent-color: var(--accent); }
+.rank-named select { font: inherit; font-size: 11px; color: var(--text);
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 2px; }
+#rank-count { padding: 0 12px 6px; font-size: 11px; color: var(--muted); }
+#rank-wrap { flex: 1; overflow-y: auto; border-top: 1px solid var(--line); }
+#rank-table { width: 100%; border-collapse: collapse; font-size: 11.5px; table-layout: fixed; }
+#rank-table th {
+  position: sticky; top: 0; z-index: 1; background: var(--panel);
+  font-size: 10px; font-weight: 600; color: var(--muted); text-align: right;
+  padding: 6px 6px 5px; border-bottom: 1px solid var(--line);
+  cursor: pointer; user-select: none; white-space: nowrap;
+}
+#rank-table th:hover, #rank-table th.sorted { color: var(--text); }
+#rank-table th.name { text-align: left; width: 34%; }
+#rank-table th:first-child { width: 30px; }
+#rank-table td { padding: 4px 6px; text-align: right; white-space: nowrap;
+  border-bottom: 1px solid rgba(51,58,66,.45); }
+#rank-table td.name { text-align: left; overflow: hidden; text-overflow: ellipsis; }
+#rank-table td.rank-n { color: var(--muted); font-size: 10.5px; }
+#rank-table tbody tr { cursor: pointer; }
+#rank-table tbody tr:hover { background: var(--panel-2); }
+#rank-table tbody tr.sel { background: rgba(255,194,61,.14); }
+.rank-sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+  margin-right: 6px; vertical-align: 0; }
+.rank-sw.t-trails { background: #d6332b; }
+.rank-sw.t-peaks { background: #ffd166; clip-path: polygon(50% 0, 100% 100%, 0 100%); border-radius: 0; }
+.rank-sw.t-passes { background: #e08cff; }
+.rank-more {
+  display: block; margin: 8px auto 12px; padding: 5px 12px; font: inherit; font-size: 11px;
+  color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 5px; cursor: pointer;
+}
+.rank-more:hover { border-color: var(--accent); }
+#rank-toggle {
+  position: absolute; top: 10px; right: 282px; z-index: 1000;
+  padding: 6px 10px; font: inherit; font-size: 11.5px; color: var(--text);
+  background: rgba(29,33,38,.96); border: 1px solid var(--line); border-radius: 6px;
+  cursor: pointer;
+}
+#rank-toggle[hidden] { display: none; }
+#rank-toggle:hover { border-color: var(--accent); }
+
+/* label on a hovered trail's highest-V point */
+.leaflet-tooltip.best-tip {
+  padding: 1px 6px; font-size: 11px; font-weight: 600;
+  color: #11141a; background: #ffffff; border: 1px solid #11141a;
+  border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+}
+.leaflet-tooltip-top.best-tip::before { border-top-color: #11141a; }
+.leaflet-tooltip-bottom.best-tip::before { border-bottom-color: #11141a; }
+.leaflet-tooltip-right.best-tip::before { border-right-color: #11141a; }
+.leaflet-tooltip-left.best-tip::before { border-left-color: #11141a; }
+
 /* ---- feature hover card ----
    Follows the pointer (placeHoverCard) and never takes the mouse, so it
    cannot steal the hover from the feature it describes. */
@@ -242,6 +320,8 @@ html, body {
   padding: 1px 0; font-variant-numeric: tabular-nums; }
 .hc-row .k { color: var(--muted); }
 .hc-row .v { text-align: right; }
+.hc-score.first { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--line); }
+.hc-score .v.main { font-weight: 600; color: var(--text); }
 .hc-foot { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--line);
   color: #5c6672; font-size: 10px; }
 
@@ -678,7 +758,7 @@ body.pano-resizing { cursor: ns-resize; user-select: none; }
 
 #status {
   position: absolute;
-  bottom: var(--pano-h); right: 0;
+  bottom: var(--pano-h); right: var(--rank-w);
   z-index: 1000;
   display: flex;
   gap: 14px;

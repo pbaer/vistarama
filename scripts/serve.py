@@ -135,6 +135,23 @@ class Handler(SimpleHTTPRequestHandler):
             return self._api_texture(parse_qs(parsed.query))
         if parsed.path == "/api/vscore":
             return self._api_vscore(parse_qs(parsed.query))
+        if parsed.path == "/api/feature_scores":
+            import featurescore
+            slug = parse_qs(parsed.query).get("slug", ["alpine-lakes"])[0]
+            return self._json(featurescore.summaries(slug))
+        if parsed.path == "/api/score_all_status":
+            # progress of scripts/score_all.py, which rewrites this file
+            # after every chunk; absent if it has never run
+            slug = parse_qs(parsed.query).get("slug", ["alpine-lakes"])[0]
+            sp = ROOT / "data" / "derived" / slug / "score_all.json"
+            if not sp.exists():
+                return self._json({"state": "none"})
+            return self._json(json.loads(sp.read_text(encoding="utf-8")))
+        if parsed.path == "/api/feature_score_job":
+            import featurescore
+            jid = parse_qs(parsed.query).get("job", [""])[0]
+            st = featurescore.status(jid)
+            return self._json(st or {"error": "no such job"}, 200 if st else 404)
         if parsed.path in ("/", "/index.html"):
             self.send_response(302)
             self.send_header("Location", "/viewer/index.html")
@@ -283,6 +300,37 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+    def _json(self, obj, status: int = 200):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):  # noqa: N802
+        """Start scoring a trail, peak or pass (see featurescore.py).
+
+        POST rather than GET because it writes to the score store. Answers at
+        once: with the stored score if a valid one exists, otherwise with a
+        job id to poll at /api/feature_score_job.
+        """
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/feature_score":
+            return self._json({"error": "not found"}, 404)
+        try:
+            import featurescore
+            n = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(n) or b"{}")
+            res = featurescore.start(req.get("slug", "alpine-lakes"),
+                                     req["theme"], req["id"])
+            return self._json(res)
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            return self._json({"error": str(exc)}, 400)
 
     def _api_vscore(self, q: dict):
         """The view score V at one point, with its full breakdown.

@@ -20,6 +20,12 @@ surface normal.
   taper with distance as exp(-d / D_HAZE_M).
 * `c(class)` weights the land cover *at the visible terrain*, not at the
   observer.
+* The DEM is bare earth, so trees are added back as occluders: a line of
+  sight is attenuated for every metre it runs through tree-covered ground
+  less than CANOPY_H_M above it, within CANOPY_REACH_M of the observer, as
+  exp(-path / CANOPY_MFP_M). Under forest the view is glimpses up through
+  the canopy; across a lake or meadow it is clear; and it is per ray, so a
+  lakeshore keeps its view over the water with the forest at its back.
 
 The march uses the panorama's geometry (same DEM, same bilinear sampling, same
 curvature and refraction term, same observer-centred azimuthal frame), so the
@@ -33,6 +39,8 @@ relief) and how much of the march the data edge cut short.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 from pathlib import Path
@@ -41,6 +49,12 @@ import numpy as np
 from pyproj import Transformer
 
 import panorama
+
+# Bump when the *method* changes in a way the parameters below do not capture
+# (how bands are credited, how rays end at the data edge, the sampling
+# geometry...). Stored scores carry this and a hash of every parameter, see
+# `version_tag`, and anything stored under another tag is recomputed.
+ALGORITHM_VERSION = 2
 
 # ---- parameters (docs/visibility-metric.md, "Parameter inventory") ----------
 
@@ -86,6 +100,18 @@ STEP_M = 30.0
 # convergence, which over 1 km is far below a millimetre.
 KNOT_M = 1000.0
 
+# Canopy occlusion. The DEM is bare earth: a viewpoint in forest "sees" the
+# walls above it through the trees. A line of sight is treated as inside the
+# canopy wherever it is less than CANOPY_H_M above tree-covered ground (the
+# WorldCover tree class), and is attenuated as exp(-metres inside /
+# CANOPY_MFP_M), the mean free path of a horizontal sightline through forest.
+# Only the first CANOPY_REACH_M count: beyond it a sightline still inside
+# canopy is already gone (exp(-600 / 40) ~ 3e-7), and one above it stays above.
+CANOPY_H_M = 30.0
+CANOPY_MFP_M = 40.0
+CANOPY_REACH_M = 600.0
+TREE_CLASS = 10
+
 # Land-cover interest weights, by ESA WorldCover class, in the doc's four
 # coarse groups plus built-up. The doc ranks glaciers above snow and ice, but
 # there is no glacier raster here yet (RGI needs a login, OSM glaciers are
@@ -114,6 +140,27 @@ DIST_BANDS_KM = (0.3, 1, 3, 10, 30, 60, 100, 150)
 CHUNK_AZ = 120
 
 
+def version_tag() -> str:
+    """Identifies the scoring method a stored V was computed with.
+
+    The manual ALGORITHM_VERSION alone would rely on someone remembering to
+    bump it; the parameter hash alone would miss changes to the method that
+    move no constant. Together, any change to either invalidates old scores.
+    """
+    params = {
+        "gamma": GAMMA, "d_haze_m": D_HAZE_M, "near_cutoff_m": NEAR_CUTOFF_M,
+        "range_m": RANGE_M, "eye_m": EYE_HEIGHT_M, "n_az": N_AZ,
+        "step_m": STEP_M, "knot_m": KNOT_M,
+        "class_weights": {str(k): w for k, (_n, w) in sorted(CLASS_WEIGHTS.items())},
+        "canopy_h_m": CANOPY_H_M, "canopy_mfp_m": CANOPY_MFP_M,
+        "canopy_reach_m": CANOPY_REACH_M,
+        "unknown_weight": UNKNOWN_WEIGHT,
+        "refraction_k": panorama.REFRACTION_K, "earth_r": panorama.EARTH_R,
+    }
+    h = hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()
+    return f"v{ALGORITHM_VERSION}-{h[:10]}"
+
+
 def _class_lut() -> np.ndarray:
     lut = np.full(256, UNKNOWN_WEIGHT, dtype=np.float64)
     for code, (_name, w) in CLASS_WEIGHTS.items():
@@ -125,7 +172,7 @@ def view_score(dem_path: Path, landcover_path: Path | None,
                lat: float, lon: float, *, gamma: float = GAMMA,
                n_az: int = N_AZ, step_m: float = STEP_M,
                range_m: float = RANGE_M,
-               eye_m: float = EYE_HEIGHT_M) -> dict:
+               eye_m: float = EYE_HEIGHT_M, canopy: bool = True) -> dict:
     """V at (lat, lon), with the breakdown the viewer's score panel shows.
 
     The point is used as given: callers that want the snapped summit should
@@ -195,6 +242,9 @@ def view_score(dem_path: Path, landcover_path: Path | None,
     n_in_band = np.bincount(band_idx, minlength=n_band) * float(n_az)
     v_class = {}
     om_class = {}
+    n_reach = int(np.searchsorted(d, CANOPY_REACH_M, side="right"))
+    v_open = 0.0                          # V with no canopy occlusion
+    om_seen = 0.0                         # solid angle after occlusion
     dominance = extent = v_nohaze = om_weighted_c = 0.0
     lookdown = (math.inf, None, None)     # (angle rad, dist m, az deg)
     z_vis_min, z_vis_max = math.inf, -math.inf
@@ -240,11 +290,31 @@ def view_score(dem_path: Path, landcover_path: Path | None,
             cls = np.zeros((n, n_d), dtype=np.uint8)
         cw = lut[cls]
 
-        om = d_alpha * ds * cutoff[None, :]                 # sr, beyond cutoff
-        base = d_alpha * ds * cw * w_d[None, :]             # sr, weighted
+        # canopy transmittance of the sightline to each sample: the metres it
+        # runs less than CANOPY_H_M above tree-covered ground on the way out
+        trans = np.ones((n, n_d))
+        if canopy and lc is not None:
+            gnd = z - drop[None, :]
+            tan_t = np.tan(run)                   # the band's top edge
+            tau = np.zeros((n, n_d))
+            jj = np.arange(n_d)[None, :]
+            for k in range(n_reach):
+                tree = (cls[:, k] == TREE_CLASS) & alive[:, k]
+                if not tree.any():
+                    continue
+                gap = eye_z + d[k] * tan_t - gnd[:, k:k + 1]
+                inside = (gap < CANOPY_H_M) & (jj > k) & tree[:, None]
+                tau += inside * step_m
+            trans = np.exp(-tau / CANOPY_MFP_M)
+
+        om_open = d_alpha * ds * cutoff[None, :]            # sr, beyond cutoff
+        om = om_open * trans                                # sr, as seen
+        base = d_alpha * ds * cw * w_d[None, :] * trans     # sr, weighted
         contrib = base * pow_g[None, :]
 
         v_az[a0:a0 + n] = contrib.sum(axis=1)
+        v_open += float((d_alpha * ds * cw * w_d[None, :] * pow_g[None, :]).sum())
+        om_seen += float(om.sum())
         omega_az[a0:a0 + n] = om.sum(axis=1)
         dominance += float((base * pow_0[None, :]).sum())
         extent += float((base * pow_2[None, :]).sum())
@@ -318,7 +388,7 @@ def view_score(dem_path: Path, landcover_path: Path | None,
     return {
         "lat": lat, "lon": lon,
         "ground_m": round(ground, 1), "eye_m": eye_m,
-        "V": V, "units": "sr·km",
+        "V": V, "units": "sr·km", "version": version_tag(),
         "params": {
             "gamma": gamma, "d_haze_km": D_HAZE_M / 1000.0,
             "near_cutoff_m": NEAR_CUTOFF_M, "range_km": range_m / 1000.0,
@@ -327,11 +397,15 @@ def view_score(dem_path: Path, landcover_path: Path | None,
             "class_weights": [{"code": c, "name": n, "weight": w}
                               for c, (n, w) in CLASS_WEIGHTS.items()],
             "unknown_weight": UNKNOWN_WEIGHT,
+            "canopy": canopy and lc is not None,
+            "canopy_h_m": CANOPY_H_M, "canopy_mfp_m": CANOPY_MFP_M,
+            "canopy_reach_m": CANOPY_REACH_M,
         },
         "axes": {
             "dominance_sr": dominance,          # same sum at gamma = 0
             "extent_km2": extent,               # same sum at gamma = 2
             "v_no_haze": v_nohaze,
+            "v_no_canopy": v_open,
         },
         "visible": {
             "omega_sr": omega,
@@ -339,6 +413,7 @@ def view_score(dem_path: Path, landcover_path: Path | None,
             "sky_frac_sphere": sky / (4 * math.pi),
             "mean_class_weight": om_weighted_c / omega if omega else 0.0,
             "haze_factor": V / v_nohaze if v_nohaze else 0.0,
+            "canopy_factor": V / v_open if v_open else 1.0,
             "median_dist_km": med_d / 1000.0,
             "max_sightline_km": max_sight / 1000.0,
             "lookdown_deg": (math.degrees(lookdown[0])

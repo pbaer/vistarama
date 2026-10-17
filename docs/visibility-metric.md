@@ -21,6 +21,9 @@ Combined at the end. Companion to
 viewer's score panel. The README's "View score" section has the parameters as
 built (720 rays × 30 m, numeric class weights) and the first readings.
 
+As built, V also carries a canopy transmittance `T` that this part did not
+originally specify; see "Canopy occlusion" below.
+
 ---
 
 ## Two axes, not one
@@ -236,6 +239,40 @@ Sampled at the **hit cell**, not at the observer. From ESA WorldCover + RGI:
 A refinement at no extra cost: weight by the elevation of the hit cell relative
 to the observer. Terrain rising above your horizon reads differently from
 terrain below it.
+
+---
+
+## Canopy occlusion
+
+Added after the first scoring run. The DEM is bare earth, so a viewpoint in
+forest sees the terrain around it straight through the trees. That put the
+best point of Snow Lakes Trail at the mouth of Snow Creek's canyon, under 89%
+canopy, rather than in the Enchantments, and made a forested ridge above
+Leavenworth the top-ranked trail in the AOI.
+
+Each newly visible band is multiplied by
+
+```
+T = exp(−L / λ)
+```
+
+where `L` is the length of the sightline, within the first 600 m, that runs
+less than `h_c` above ground of the tree class, with `h_c` = 30 m and the mean
+free path `λ` = 40 m. The test uses the band's top edge, the most open line to
+it. A sightline up a wall from the forest floor clears the canopy within tens
+of metres and is dimmed, not lost; one across the forest is gone; one over a
+lake or meadow is untouched.
+
+This takes the place of the canopy *gate* in
+[scenery-scoring-data.md](scenery-scoring-data.md). A gate is per point:
+it can only say a lakeshore inside woodland is forested or not. Occlusion is
+per ray, so the same point keeps the view over the water and loses the one
+behind it, which is the per-point nuance the gate section asks for, taken
+one step further.
+
+The class weight `c` is unchanged: trees *in* the view (a forested valley
+seen from a summit) still count at 0.3. `T` is only about trees *between*
+you and the view.
 
 ---
 
@@ -492,6 +529,7 @@ Keeping this list short is a design goal in itself.
 | `γ` | extent vs dominance in `V` | 1.0 | **yes**, 0.8–1.3 |
 | `d_haze` | atmospheric taper | 60 km | maybe, 50–80 km |
 | near cutoff | ignore the cell underfoot | 300 m | no |
+| `h_c`, `λ` | canopy height, mean free path in forest | 30 m, 40 m | maybe |
 | `c(class)` | land-cover interest weights | table above | coarsely, ~4 groups |
 | `R_kernel` | ruggedness radius | 10 km | **yes**, 5–20 km |
 | kernel exponent | near-field emphasis | 2 (biweight) | rarely |

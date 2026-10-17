@@ -814,6 +814,29 @@ def build_vector_lod(slug: str, out_dir: Path,
             log(f"vectors {theme}: empty, skipping")
             continue
 
+        # Trails carry their length and, when OSM splits them into several
+        # ways, which trail they belong to. The viewer highlights the whole
+        # trail on hover and shows segment and trail lengths in the card. The
+        # grouping is featurescore's own, so the highlight is exactly what V
+        # scores. Lengths are geodesic, from the raw geometry, so the
+        # simplified tiers report the same numbers as the full one.
+        trail_info = {}
+        if theme == "trails":
+            import featurescore
+            from pyproj import Geod
+            geod = Geod(ellps="WGS84")
+            seg = {f["id"]: geod.geometry_length(shape(f["geometry"]))
+                   for f in feats if f.get("id")}
+            groups = featurescore.trail_groups(slug)
+            for wid, m in seg.items():
+                info = {"len": round(m)}
+                members = groups.get(wid)
+                if members and len(members) > 1:
+                    info["trail"] = featurescore.group_key(members)
+                    info["trail_len"] = round(sum(seg.get(x, 0.0) for x in members))
+                    info["trail_n"] = len(members)
+                trail_info[wid] = info
+
         entries = []
         for tier, tol in tiers:
             point_limit = POINT_TIER_LIMIT.get(theme, {}).get(tier)
@@ -847,11 +870,20 @@ def build_vector_lod(slug: str, out_dir: Path,
                         g = mapping(s)
                     except Exception:  # noqa: BLE001
                         pass
-                out_feats.append({
+                feat = {
                     "type": "Feature",
                     "properties": f["properties"],
                     "geometry": _round_coords(dict(g)),
-                })
+                }
+                # the OSM id ("way/123", "node/456"): the viewer keys stored
+                # view scores by it, and it is what ties a simplified tile
+                # feature back to its full-resolution raw geometry
+                if f.get("id"):
+                    feat["id"] = f["id"]
+                    # GeoJSON foreign members, so they stay out of the tag
+                    # table the Alt-click popup shows
+                    feat.update(trail_info.get(f["id"], {}))
+                out_feats.append(feat)
 
             def dump(features):
                 return json.dumps(

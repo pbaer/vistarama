@@ -98,6 +98,8 @@ reads them.
 | `peak_prominence.json` | `prominence.py` | rebuilt whenever it runs |
 | Panorama mesh + textures | `serve.py`, per request | never; only whole rasters are cached in memory |
 | View score `V` | `serve.py` via `vscore.py`, per request | never (the viewer reuses it for a range change at the same point) |
+| `derived/<aoi>/feature_scores.json` | `featurescore.py` (the V key) and `score_all.py` (everything) | while its version tag matches the current scoring method |
+| `derived/<aoi>/score_all.json` | `score_all.py`, after every chunk | progress for the viewer's ranked list; the log is `score_all.log` |
 
 The completion marker matters: "does this directory contain any PNG?" answers
 yes for a pyramid whose generation was interrupted half way, and that partial
