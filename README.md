@@ -128,7 +128,7 @@ the water with the forest at its back, which a per-point gate cannot do.
 ## "View from here" — interactive 3D
 
 Press **V** with the cursor anywhere over the map, or click a trail, peak,
-pass, lake, camp or viewpoint. A click on empty map only clears the ranked
+pass, lake or camp. A click on empty map only clears the ranked
 list's selection, and Alt-click opens a feature's tags. A pane opens at the
 bottom with a WebGL rendering of the surrounding terrain, with the view score
 for that spot in its lower-left corner: collapsed to the score, expanded for
@@ -577,12 +577,12 @@ on later hovers without recomputing, across reloads
   into another mountain) the node is scored where it is: slightly low rather
   than the wrong mountain.
 - **Passes** are scored at the node. Snapping would climb out of the saddle.
-- **Camps** (campsites, huts and trail shelters) are scored at the node, or at
-  a point inside a campsite mapped as an area. They come from the same OSM
-  download as viewpoints, springs and drinking water, which the map now shows
-  as two layers: **Camps**, with the water sources alongside (not scored), and
-  **Viewpoints**. Bus, picnic and gazebo shelters are in neither
-  (`featurescore.poi_kind` decides, for the tiles and the scores alike).
+- **Camps** (campsites, huts and trail shelters) are scored at their point.
+  Every camp is a point: a campsite mapped as an area is collapsed to its
+  geometric centre when the data is downloaded (`download.camp_points`). Bus,
+  picnic and gazebo shelters are left out (`featurescore.poi_kind`). The POI
+  download no longer keeps springs, drinking water or OSM viewpoints:
+  finding the viewpoints is what V is for.
 - **Lakes** are scored along their shoreline, the way a trail is along its
   path: a point every 50 m around each outer ring (islands are left out),
   averaged, and the same along-the-path search for the best point, wrapping
@@ -768,6 +768,36 @@ web (EPSG:3857)          XYZ pyramids (PNG, JPEG for imagery) + zoom-tiered
 
 The panorama does not use `web/`: `serve.py` builds its mesh and textures per
 request from `interim/` and `derived/`.
+
+Vectors are cut into zoom tiers (`process.VECTOR_LOD`): low up to z9, mid to
+z11, high to z13, and full beyond for roads and trails. Each coarser tier keeps
+only what still reads at its scale, since performance matters more than detail
+when zoomed out:
+
+- **Roads:** not drawn at all below z9, and thinner and half transparent at
+  z9–11, so they orient without hiding the terrain. Low keeps motorway, trunk
+  and primary; mid adds secondary, tertiary and the motorway links; high adds
+  unclassified (most forest roads); only full draws residential streets.
+- **Rivers:** at low only actual rivers, at mid rivers and canals.
+- **Trails:** at high, named trails plus unnamed paths over ~120 m.
+- **Merging:** at low and mid, road ways sharing class, route number and name
+  are joined into continuous lines (OSM splits a highway at every bridge).
+- **Tags:** cut to the ones the viewer reads, through high for roads and
+  rivers.
+
+A large tier is split into a grid sized per tier in degrees, so a view fetches
+a few nearby cells. It stays one file when gridding would not shrink what a
+view fetches, as with national-forest polygons, which land in every cell they
+touch.
+
+Over western Washington this took the zoomed-out map from 41k road ways to
+9.4k features in all (3.1 MB), and a view of Seattle at z13 from 53 MB to
+5.6 MB.
+
+The sea is a raster layer (`derived/sea.tif`, tiled to z14), since OSM maps it
+only as coastline ways: WorldCover's water class wherever the DEM is within
+2 m of sea level. Lakes sit higher (Lake Washington ~6 m) and keep their own
+polygons; both are drawn in the same blue.
 
 The equal-area intermediate matters: computing the ruggedness kernel in
 lat/lon would vary its radius with latitude and fabricate a north–south

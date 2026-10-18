@@ -151,6 +151,9 @@ def ramp_rgba(
 
 TRANSPARENT_INDEX = 255
 
+# open water, as the viewer draws lakes and rivers (viewer/app.js WATER_BLUE)
+WATER_BLUE = (0x2f, 0x6f, 0x9f)
+
 
 def _palette_bytes(colors: list[tuple[int, int, int]]) -> bytes:
     flat = bytearray(768)

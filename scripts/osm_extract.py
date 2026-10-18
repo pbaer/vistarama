@@ -47,8 +47,9 @@ NOT_SIDEWALK = _rx(r"^(sidewalk|crossing|traffic_island)$")
 # them anyway. Nothing is scored on roads.
 ROAD_HW = _rx(r"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential)$")
 WATERWAY = _rx(r"^(river|stream|canal)$")
-POI_TOURISM = _rx(r"^(camp_site|wilderness_hut|alpine_hut|viewpoint)$")
-POI_AMENITY = _rx(r"^(shelter|drinking_water)$")
+# camps only (see download.OSM_THEMES "poi")
+POI_TOURISM = _rx(r"^(camp_site|camp_pitch|wilderness_hut|alpine_hut)$")
+POI_AMENITY = _rx(r"^shelter$")
 
 
 def themes_for(kind: str, t: dict) -> list[str]:
@@ -73,8 +74,7 @@ def themes_for(kind: str, t: dict) -> list[str]:
     if kind == "node":
         if g("mountain_pass") == "yes" or g("natural") == "saddle":
             out.append("passes")
-        if (POI_TOURISM.match(g("tourism", "")) or POI_AMENITY.match(g("amenity", ""))
-                or g("natural") == "spring"):
+        if POI_TOURISM.match(g("tourism", "")) or POI_AMENITY.match(g("amenity", "")):
             out.append("poi")
     if kind == "way" and POI_TOURISM.match(g("tourism", "")):
         out.append("poi")
@@ -186,6 +186,11 @@ def extract(pbf, slug: str, bb) -> dict:
         fh.write("\n]}\n")
         fh.close()
         part = RAW / "osm" / f"{slug}_{th}.geojson.part"
+        if th == "poi":
+            # camps only, each a point (download.camp_points)
+            gj = download.camp_points(json.loads(part.read_text(encoding="utf-8")))
+            counts[th] = len(gj["features"])
+            part.write_text(json.dumps(gj), encoding="utf-8")
         part.replace(part.with_suffix(""))
         log(f"{slug}_{th}.geojson: {counts[th]:,} features")
     log(f"read {seen / 1e6:.1f}M objects in {(time.time() - t0) / 60:.1f} min")

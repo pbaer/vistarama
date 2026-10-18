@@ -49,25 +49,15 @@ the region replaces it completely.
 
 ## Region bounds
 
-**The core** is where features are scored:
-
-- **West:** the Pacific coast.
-- **North:** the Canadian border.
-- **South:** the Columbia River.
-- **East:** a line along the foot of the east slopes:
-  1. the Okanogan River from Oroville to its mouth at Brewster;
-  2. the Columbia River down to Wenatchee;
-  3. US 97 over Blewett Pass to Ellensburg;
-  4. I-82/US 97 to Yakima;
-  5. US 97 to Goldendale and the Columbia at Maryhill.
-
-The core takes in the Methow, Chelan, Entiat, Teanaway, Manastash, the west
-half of the Yakama Reservation and west Klickitat, and stops where the
-Columbia Plateau begins. It is about 87,000 km² of land, about 17 times the
-Alpine Lakes core.
-
-The polygon is drawn once from OSM (coastline, border, rivers, highways),
-simplified, and stored in `regions/wa-west.json`.
+**The core** is where features are scored: a box, 45.54–49.00°N and
+124.85–119.435°W (`data/aoi/wa-west.json`). It reaches the Pacific coast in
+the west, Canada in the north and the Columbia in the south, and its east
+edge is the Okanogan River at Oroville, the easternmost point of the line
+first drawn along the foot of the east slopes. A box rather than that line:
+there is no need to hug the rivers and highways, and the box also takes in
+the Wenatchee, Ellensburg, Yakima and Okanogan country east of the line
+(8,316 more items to score). OSM is the Washington extract, so Oregon and
+British Columbia have no features inside the box.
 
 **The far field** is the core plus 150 km: about 44.2–50.4°N and
 126.8–117.7°W. It reaches Hood, Jefferson and the Three Sisters to the
@@ -76,8 +66,8 @@ it, so rays never stop at a DEM edge.
 
 ## NAIP rectangles
 
-These are longitude/latitude boxes, clipped to the core and stored in
-`regions/wa-west.json` next to the polygon.
+These are longitude/latitude boxes inside the core, stored in
+`data/aoi/wa-west.json`.
 
 | Rectangle | Lat | Lon | Area | Covers |
 |---|---|---|---|---|

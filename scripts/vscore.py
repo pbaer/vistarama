@@ -178,6 +178,74 @@ def tree_count(landcover_path: Path, bounds, shape) -> np.ndarray:
         _TREE_COUNT[key] = hit
     return hit
 
+def tree_count_near(landcover_path: Path, dem_tf, shape, oc: float, orr: float):
+    """Tree counts as tree_count gives them, but only for the DEM cells within
+    CANOPY_REACH_M of (oc, orr) (DEM column, row): (row0, col0, counts).
+
+    One viewpoint's canopy test reaches no further, so this is all a single
+    score needs; tree_count over a region's whole far field read 7 gigapixels
+    of land cover and was most of a 30 s first score."""
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.windows import from_bounds
+    H, W = shape
+    cell = abs(dem_tf.a)
+    rad = int(math.ceil(CANOPY_REACH_M / cell)) + 2
+    r0, c0 = max(0, int(math.floor(orr)) - rad), max(0, int(math.floor(oc)) - rad)
+    r1, c1 = min(H, int(math.floor(orr)) + rad + 1), min(W, int(math.floor(oc)) + rad + 1)
+    if r1 <= r0 or c1 <= c0:
+        return r0, c0, np.zeros((0, 0), dtype=np.uint8)
+    k = CANOPY_SUBCELLS
+    west, north = dem_tf * (c0, r0)
+    east, south = dem_tf * (c1, r1)
+    with rasterio.open(landcover_path) as s:
+        sub = s.read(1, window=from_bounds(west, south, east, north, transform=s.transform),
+                     out_shape=((r1 - r0) * k, (c1 - c0) * k), boundless=True,
+                     fill_value=(s.nodata if s.nodata is not None else 0),
+                     resampling=Resampling.nearest)
+    counts = (sub == TREE_CLASS).reshape(r1 - r0, k, c1 - c0, k).sum(axis=(1, 3), dtype=np.uint8)
+    return r0, c0, counts
+
+
+_LC_ON_DEM: dict = {}
+
+
+def landcover_on_dem(landcover_path: Path, dem_path: Path, bounds, shape) -> np.ndarray:
+    """The land-cover class of every DEM cell (nearest), as the panorama reads
+    it, cached in memory and on disk beside the land cover. Resampling a
+    region's 10 m land cover onto its DEM grid took ~10 s per server start;
+    the cached grid reads in about one."""
+    import rasterio
+    from rasterio.enums import Resampling
+    import panorama
+    key = (str(landcover_path), tuple(np.round(np.asarray(bounds, float), 3)), tuple(shape))
+    hit = _LC_ON_DEM.get(key)
+    if hit is not None:
+        return hit
+    cache = Path(landcover_path).with_name(Path(landcover_path).stem + ".on_dem.tif")
+    newest = max(Path(landcover_path).stat().st_mtime, Path(dem_path).stat().st_mtime)
+    if cache.exists() and cache.stat().st_mtime > newest:
+        with rasterio.open(cache) as c:
+            if (c.height, c.width) == tuple(shape):
+                arr = c.read(1)
+                _LC_ON_DEM[key] = arr
+                return arr
+    arr, _ = panorama._read_window(Path(landcover_path), bounds, tuple(shape), Resampling.nearest)
+    with rasterio.open(dem_path) as d:
+        profile = {"driver": "GTiff", "dtype": "uint8", "count": 1, "width": shape[1],
+                   "height": shape[0], "crs": d.crs, "transform": d.transform,
+                   "tiled": True, "blockxsize": 512, "blockysize": 512, "compress": "deflate"}
+    try:
+        tmp = cache.with_name(cache.stem + ".part.tif")
+        with rasterio.open(tmp, "w", **profile) as out:
+            out.write(arr.astype(np.uint8), 1)
+        tmp.replace(cache)
+    except OSError:
+        pass                      # a read-only data root: the memory cache still works
+    _LC_ON_DEM[key] = arr
+    return arr
+
+
 # Land-cover interest weights, by ESA WorldCover class, in the doc's four
 # coarse groups plus built-up. The doc ranks glaciers above snow and ice, but
 # there is no glacier raster here yet (RGI needs a login, OSM glaciers are
@@ -294,9 +362,7 @@ def view_score(dem_path: Path, landcover_path: Path | None,
     if landcover_path and Path(landcover_path).exists():
         # the panorama's own land-cover read: nearest-neighbour onto the DEM
         # grid, cached, so the class at a hit is the one the 3D view colours
-        lc, _ = panorama._read_window(Path(landcover_path), dem_bounds,
-                                      dem.shape, Resampling.nearest)
-        tcount = tree_count(Path(landcover_path), dem_bounds, dem.shape)
+        lc = landcover_on_dem(Path(landcover_path), Path(dem_path), dem_bounds, dem.shape)
     lut = _class_lut()
     tscale = 1.0 / CANOPY_SUBCELLS ** 2
 
@@ -307,6 +373,10 @@ def view_score(dem_path: Path, landcover_path: Path | None,
     gz, gok = panorama._bilinear(dem, np.array([oc]), np.array([orr]), dem_bad)
     if not bool(gok[0]):
         raise ValueError("viewpoint is outside the DEM or on a void")
+    if lc is not None:
+        # the canopy test only looks within CANOPY_REACH_M, so only the trees
+        # there are counted
+        t_r0, t_c0, tcount = tree_count_near(Path(landcover_path), dem_tf, dem.shape, oc, orr)
     ground = float(gz[0])
     lift = TERRAIN_LIFT_M if lift_m is None else lift_m
     eye_z = ground + eye_m + lift         # terrain: the surveyed eye
@@ -395,7 +465,12 @@ def view_score(dem_path: Path, landcover_path: Path | None,
             cols = np.clip(np.floor(fc).astype(np.int64), 0, W - 1)
             rows = np.clip(np.floor(fr).astype(np.int64), 0, H - 1)
             cls = lc.ravel()[rows * W + cols].reshape(n, n_d)
-            tfrac = tcount.ravel()[rows * W + cols].reshape(n, n_d) * tscale
+            # trees, for the samples inside the counted window (all of those
+            # within CANOPY_REACH_M); the canopy loop reads no others
+            tr, tc_ = rows - t_r0, cols - t_c0
+            inw = (tr >= 0) & (tr < tcount.shape[0]) & (tc_ >= 0) & (tc_ < tcount.shape[1])
+            tfrac = np.zeros((n, n_d))
+            tfrac.ravel()[inw.ravel()] = tcount[tr[inw], tc_[inw]] * tscale
         else:
             cls = np.zeros((n, n_d), dtype=np.uint8)
         cw = lut[cls]

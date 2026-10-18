@@ -141,11 +141,13 @@ OSM_THEMES: dict[str, str] = {
         'node["mountain_pass"="yes"]({bbox});'
         'node["natural"="saddle"]({bbox});'
     ),
+    # Camps only: campsites, huts and trail shelters. Springs and drinking
+    # water are not wanted, and OSM viewpoints neither (finding viewpoints is
+    # what V is for). camp_points() then filters and makes every camp a point.
     "poi": (
-        'node["tourism"~"^(camp_site|wilderness_hut|alpine_hut|viewpoint)$"]({bbox});'
-        'way["tourism"~"^(camp_site|wilderness_hut|alpine_hut|viewpoint)$"]({bbox});'
-        'node["amenity"~"^(shelter|drinking_water)$"]({bbox});'
-        'node["natural"="spring"]({bbox});'
+        'node["tourism"~"^(camp_site|camp_pitch|wilderness_hut|alpine_hut)$"]({bbox});'
+        'way["tourism"~"^(camp_site|camp_pitch|wilderness_hut|alpine_hut)$"]({bbox});'
+        'node["amenity"="shelter"]({bbox});'
     ),
     "protected": (
         'way["boundary"="protected_area"]({bbox});'
@@ -302,6 +304,24 @@ def osm_to_geojson(payload: dict) -> dict:
 THEME_EXTENT = {"peaks": "buffered"}
 
 
+def camp_points(gj: dict) -> dict:
+    """The POI theme as it is kept: camps only (featurescore.poi_kind), each a
+    point. A campsite mapped as an area becomes a point at its geometric
+    centre, so it is drawn, scored and ranked like every other camp."""
+    import featurescore
+    from shapely.geometry import shape
+    out = []
+    for f in gj.get("features", []):
+        if featurescore.poi_kind(f.get("properties") or {}) != "camp":
+            continue
+        g = f.get("geometry") or {}
+        if g.get("type") != "Point":
+            c = shape(g).centroid
+            f = {**f, "geometry": {"type": "Point", "coordinates": [c.x, c.y]}}
+        out.append(f)
+    return {"type": "FeatureCollection", "features": out}
+
+
 def download_osm(slug: str, bb: tuple[float, float, float, float],
                  aoi: dict | None = None) -> None:
     out_dir = RAW / "osm"
@@ -321,6 +341,8 @@ def download_osm(slug: str, bb: tuple[float, float, float, float],
             gj = {"type": "FeatureCollection", "features": []}
         else:
             gj = osm_to_geojson(payload)
+            if theme == "poi":
+                gj = camp_points(gj)
         dest.write_text(json.dumps(gj), encoding="utf-8")
         log(f"got  {dest.name} ({len(gj['features'])} features, "
             f"{dest.stat().st_size / 1e6:.1f} MB)")

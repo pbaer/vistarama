@@ -64,10 +64,9 @@ POOL_WORKERS = 8
 SCORABLE = {"trails": "line", "peaks": "summit", "passes": "point",
             "water_areas": "shore", "camps": "point"}
 
-# Themes that are a filtered view of another raw OSM file: the POI download
-# holds huts, camps, shelters, viewpoints and water sources together, and the
-# map and the scores split it (poi_kind).
-RAW_THEME = {"camps": "poi", "viewpoints": "poi"}
+# Themes that are a filtered view of another raw OSM file: the camps come
+# from the POI download (poi_kind).
+RAW_THEME = {"camps": "poi"}
 
 # Shelters that are not somewhere to stay: bus stops, picnic shelters, gazebos.
 NOT_CAMP_SHELTERS = {"public_transport", "picnic_shelter", "gazebo", "field_shelter",
@@ -75,18 +74,14 @@ NOT_CAMP_SHELTERS = {"public_transport", "picnic_shelter", "gazebo", "field_shel
 
 
 def poi_kind(props: dict) -> str | None:
-    """What a POI is: 'camp' (campsite, hut or trail shelter: scored),
-    'water' (spring or drinking water: shown with the camps, not scored),
-    'viewpoint', or None (nothing this project shows)."""
+    """What a POI is: 'camp' (campsite, hut or trail shelter: scored), or
+    None (nothing this project keeps). Springs and drinking water were
+    dropped, and OSM viewpoints too: finding viewpoints is what V is for."""
     t, a = props.get("tourism"), props.get("amenity")
-    if t == "viewpoint":
-        return "viewpoint"
     if t in ("camp_site", "camp_pitch", "alpine_hut", "wilderness_hut"):
         return "camp"
     if a == "shelter":
         return None if props.get("shelter_type") in NOT_CAMP_SHELTERS else "camp"
-    if a == "drinking_water" or props.get("natural") == "spring":
-        return "water"
     return None
 
 # Lakes are scored along their shoreline, like a trail along its path. Only
@@ -590,9 +585,10 @@ def build_item(slug: str, theme: str, fid: str) -> dict:
         if feat["geometry"]["type"] == "Point":
             lon, lat = feat["geometry"]["coordinates"][:2]
         else:
-            # a campsite mapped as an area: a point guaranteed inside it
+            # a campsite mapped as an area, if one is still in the data:
+            # its geometric centre, as download.camp_points makes it
             from shapely.geometry import shape
-            rp = shape(feat["geometry"]).representative_point()
+            rp = shape(feat["geometry"]).centroid
             lon, lat = rp.x, rp.y
         moved = 0.0
         if kind == "summit":
@@ -938,6 +934,25 @@ def save_many(slug: str, records: list[dict]) -> None:
         tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
         os.replace(tmp, p)        # never leave a half-written store behind
+
+
+def drop_many(slug: str, ids: list[str]) -> int:
+    """Remove the records for these ids (record keys or member ids), and
+    every alias pointing at them, so a later score_all rescores them."""
+    p = _store_path(slug)
+    if not p.exists():
+        return 0
+    with _store_lock, _FileLock(p.with_suffix(".lock")):
+        data = _load(slug)
+        keys = {data["aliases"].get(i, i) for i in ids}
+        keys &= set(data["scores"])
+        for k in keys:
+            del data["scores"][k]
+        data["aliases"] = {w: k for w, k in data["aliases"].items() if k not in keys}
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, p)
+    return len(keys)
 
 
 _summary_cache: dict = {}

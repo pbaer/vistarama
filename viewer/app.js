@@ -13,17 +13,33 @@ const DATA_ROOT = `/data/web/${AOI}/`;
 const TIER_BREAKS = [
   { maxZoom: 9, tier: 'low' },
   { maxZoom: 11, tier: 'mid' },
-  { maxZoom: 99, tier: 'high' },
+  { maxZoom: 13, tier: 'high' },
+  { maxZoom: 99, tier: 'full' },    // roads only: residential streets
 ];
-const TIER_ORDER = ['low', 'mid', 'high'];
+const TIER_ORDER = ['low', 'mid', 'high', 'full'];
 
 // Themes that should be *hidden* below a tier rather than fall back to a finer
 // one. `resolveTier` climbs upward when nothing coarse enough exists, which is
-// what `passes`, `camps` and `viewpoints` want — they only ship at `high` and should still be
+// what `passes` and `camps` want — they only ship at `high` and should still be
 // drawn when zoomed out. Trails are the opposite case: dropping `trails.low`
 // to declutter z8 instead promoted them to the full 20k-feature `mid` tier,
 // which is strictly worse than what it replaced.
 const TIER_MIN_VISIBLE = { trails: 'mid' };
+// Below this zoom a theme is not drawn at all. Zoomed out the roads hid the
+// terrain they cross, and performance matters more there than road detail.
+// Camps and passes are point clutter until zoomed in.
+const THEME_MIN_ZOOM = { roads: 9, camps: 10, passes: 10 };
+// ... and at the coarse tiers they recede: thinner and half transparent, so
+// they orient without dominating (see tierStyle).
+const ROAD_DIM_TIERS = { low: { w: 0.55, o: 0.45 }, mid: { w: 0.7, o: 0.6 } };
+
+/** A feature's style at a given tier: the class style, dimmed for roads at
+ *  the coarse tiers. */
+function tierStyle(theme, tier, st) {
+  const d = theme === 'roads' && ROAD_DIM_TIERS[tier];
+  if (!d) return st;
+  return { ...st, weight: (st.weight || 1) * d.w, opacity: (st.opacity ?? 1) * d.o };
+}
 
 const RAMP_CSS = {
   hillshade: 'linear-gradient(90deg,#000,#fff)',
@@ -35,16 +51,17 @@ const RAMP_CSS = {
   builtup_density: 'linear-gradient(90deg,#fafafa,#f5cdbe,#e2745a,#b01414)',
 };
 
-const DEFAULT_ON = ['hillshade', 'dem'];
+const DEFAULT_ON = ['hillshade', 'dem', 'sea'];
 // Imagery is a base image, not a measurement painted over one, so it goes on
 // opaque. NAIP sits above Sentinel-2 wherever it exists.
-const DEFAULT_OPACITY = { hillshade: 1.0, dem: 0.75, imagery_s2: 1.0, imagery_naip: 1.0 };
+// the sea at the lakes' fill opacity, so the two read as one water
+const DEFAULT_OPACITY = { hillshade: 1.0, dem: 0.75, imagery_s2: 1.0, imagery_naip: 1.0, sea: 0.8 };
 // one blue for open water: rivers, streams, lakes and their outlines
 const WATER_BLUE = '#2f6f9f';
 
 const VECTOR_ORDER = [
   'protected', 'glaciers', 'water_areas', 'water_lines',
-  'roads', 'trails', 'passes', 'camps', 'viewpoints', 'peaks',
+  'roads', 'trails', 'passes', 'camps', 'peaks',
 ];
 
 // ---------------------------------------------------------------------------
@@ -228,30 +245,20 @@ const VECTOR_STYLE = {
       _default: { label: 'Pass', color: '#e08cff', shape: 'bowtie', radius: 4 },
     },
   },
-  // camps and viewpoints are both split from the POI download (process.py,
-  // featurescore.poi_kind); the water sources ride along with the camps
+  // camps come from the POI download, camps only and each a point
+  // (download.camp_points, featurescore.poi_kind)
   camps: {
     label: 'Camps', kind: 'point', color: '#7fd28f',
     classify: (p) => (
       (p.tourism === 'camp_site' || p.tourism === 'camp_pitch') ? 'camp_site'
         : (p.tourism === 'alpine_hut' || p.tourism === 'wilderness_hut') ? 'hut'
           : p.amenity === 'shelter' ? 'shelter'
-            : (p.amenity === 'drinking_water' || p.natural === 'spring') ? 'water'
-              : '_default'),
+            : '_default'),
     classes: {
       camp_site: { label: 'Campsite', color: '#7fd28f', shape: 'tent', radius: 5 },
       hut: { label: 'Hut', color: '#ff9d6e', shape: 'house', radius: 5 },
       shelter: { label: 'Shelter', color: '#d5a6ff', shape: 'square', radius: 4 },
-      water: { label: 'Spring / water', color: '#6fc7ff', shape: 'drop', radius: 4.5 },
       _default: { label: 'Camp', color: '#7fd28f', shape: 'circle', radius: 3.5 },
-    },
-  },
-  viewpoints: {
-    label: 'Viewpoints', kind: 'point', color: '#ffd98a',
-    classify: () => 'viewpoint',
-    classes: {
-      viewpoint: { label: 'Viewpoint', color: '#ffd98a', shape: 'diamond', radius: 5 },
-      _default: { label: 'Viewpoint', color: '#ffd98a', shape: 'diamond', radius: 5 },
     },
   },
   peaks: {
@@ -277,7 +284,7 @@ function classOf(theme, props) {
   return s.classes[key] || s.classes._default;
 }
 
-const DEFAULT_VECTORS_ON = ['trails', 'water_areas', 'roads'];
+const DEFAULT_VECTORS_ON = ['trails', 'water_areas', 'water_lines', 'roads', 'camps', 'peaks'];
 
 // ---------------------------------------------------------------------------
 
@@ -410,7 +417,7 @@ window.mapView = { map, rasterLayers, vectorLayers, get manifest() { return mani
 
 function tierForZoom(z) {
   for (const b of TIER_BREAKS) if (z <= b.maxZoom) return b.tier;
-  return 'high';
+  return 'full';
 }
 
 /** Nearest available tier at or below the requested detail level. */
@@ -496,6 +503,8 @@ function buildRasters(layers) {
     cb.addEventListener('change', () => {
       row.classList.toggle('off', !cb.checked);
       if (cb.checked) layer.addTo(map); else map.removeLayer(layer);
+      // a layer switched back on would otherwise land on top of the others
+      restack();
       renderLegend();
     });
 
@@ -503,10 +512,13 @@ function buildRasters(layers) {
     list.appendChild(row);
   });
   // keep a stable stacking order: first in the manifest sits lowest
-  layers.forEach((spec) => {
-    const l = rasterLayers[spec.id];
-    if (map.hasLayer(l)) l.bringToFront();
-  });
+  function restack() {
+    layers.forEach((spec) => {
+      const l = rasterLayers[spec.id];
+      if (map.hasLayer(l)) l.bringToFront();
+    });
+  }
+  restack();
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,7 +1210,7 @@ function hoverEnd(layer) {
   hideBestPoint();
 }
 
-function makeGeoJsonLayer(theme, data) {
+function makeGeoJsonLayer(theme, data, tier) {
   const s = VECTOR_STYLE[theme];
   const opts = {
     renderer: vectorRenderer,
@@ -1252,7 +1264,7 @@ function makeGeoJsonLayer(theme, data) {
   // includes the markers pointToLayer just built. Passing a line/polygon
   // style here silently overrode their fill and weight and rendered every
   // point layer invisible — so only set it for non-point themes.
-  if (s.kind !== 'point') opts.style = (f) => styleFor(theme, f.properties);
+  if (s.kind !== 'point') opts.style = (f) => tierStyle(theme, tier, styleFor(theme, f.properties));
   const layer = L.geoJSON(data, opts);
   // remember which categories this chunk actually contains, so the legend can
   // list only what's on screen rather than every class the table defines
@@ -1295,7 +1307,7 @@ async function loadChunk(theme, entry, cell) {
   const pending = fetch(url)
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
     .then((data) => {
-      const layer = makeGeoJsonLayer(theme, data);
+      const layer = makeGeoJsonLayer(theme, data, entry.tier);
       if (SCORABLE_THEMES.has(theme)) {
         scoredChunks.add([theme, layer]);
         scoreChunk(theme, layer);
@@ -1314,7 +1326,10 @@ async function syncVectorTier(theme) {
 
   const zTier = tierForZoom(map.getZoom());
   const floor = TIER_MIN_VISIBLE[theme];
-  if (floor && TIER_ORDER.indexOf(zTier) < TIER_ORDER.indexOf(floor)) {
+  if ((floor && TIER_ORDER.indexOf(zTier) < TIER_ORDER.indexOf(floor))
+      || map.getZoom() < (THEME_MIN_ZOOM[theme] ?? 0)) {
+    // chunks still loading from before the zoom out must not land after it
+    state.token++;
     for (const [key, layer] of state.onMap) {
       state.group.removeLayer(layer);
       state.onMap.delete(key);
@@ -1428,15 +1443,16 @@ function buildExtents(aoi) {
   const defs = [
     ['core', 'Core AOI', '#ffd166', true],
     ['vector', 'Vector extent', '#6fb2ff', false],
-    ['buffered', 'Raster extent (+60 km)', '#ff7b7b', true],
+    ['buffered', `Raster extent (+${aoi.buffer_km || 60} km)`, '#ff7b7b', true],
   ];
   defs.forEach(([key, label, color, on]) => {
     const b = aoi[key];
     if (!b) return;
-    const rect = L.rectangle(
-      [[b.south, b.west], [b.north, b.east]],
-      { color, weight: 1.4, fill: false, dashArray: '5,4', interactive: false },
-    );
+    const style = { color, weight: 1.4, fill: false, dashArray: '5,4', interactive: false };
+    // a region's core is its traced outline, not the box around it
+    const rect = key === 'core' && aoi.core_polygon
+      ? L.polygon(aoi.core_polygon.map(([x, y]) => [y, x]), style)
+      : L.rectangle([[b.south, b.west], [b.north, b.east]], style);
     const row = el('div', `layer${on ? '' : ' off'}`);
     const head = el('label', 'layer-head');
     const cb = el('input');
@@ -1861,10 +1877,11 @@ document.addEventListener('mousedown', (ev) => {
     ? { x: ev.clientX, y: ev.clientY } : null;
 }, true);
 
-// Items a click moves the viewpoint to: places to stand and look from.
+// Items a click moves the viewpoint to: places to stand and look from (the
+// scorable ones).
 // Anywhere else (empty map, a road, a river) a click only clears the ranked
 // list's selection; the V key moves the viewpoint there instead.
-const VIEWPOINT_THEMES = new Set([...SCORABLE_THEMES, 'viewpoints']);
+const VIEWPOINT_THEMES = SCORABLE_THEMES;
 
 document.addEventListener('click', (ev) => {
   if (ev.button !== 0 || ev.altKey || !pickTarget(ev)) return;
@@ -2608,6 +2625,9 @@ function renderViewScore(d) {
   }
   $('vs-value').textContent = vsFmt(d.V);
   setUnits(document.querySelector('#vscore .vs-unit'));
+  // "×0.89 · lowers V 0.17 → 0.15"
+  const vsFactor = (f, without, v) => `×${f.toFixed(2)} · ${f < 1 ? 'lowers' : f > 1 ? 'raises' : 'leaves'} V `
+    + `${vsFmt(without)} → ${vsFmt(v)}`;
   $('vs-state').textContent = `${d.elapsed_ms} ms`;
   const body = $('vs-body');
   body.replaceChildren();
@@ -2620,9 +2640,11 @@ function renderViewScore(d) {
     vsRow('Median distance, by solid angle', vsKm(vis.median_dist_km)),
     vsRow('dᵞ at that distance', (vis.median_dist_km ** P.gamma).toFixed(2)),
     vsRow('Mean land-cover weight c', vis.mean_class_weight.toFixed(2)),
-    vsRow('Haze factor w', `${vis.haze_factor.toFixed(2)} (V ${vsFmt(ax.v_no_haze)} without)`),
-    vsRow('Canopy factor T', `${vis.canopy_factor.toFixed(2)} (V ${vsFmt(ax.v_no_canopy)} without trees)`),
-    vsRow('Looming factor u', `${vis.loom_factor.toFixed(2)} (V ${vsFmt(ax.v_no_loom)} without)`),
+    // each factor as the multiplier it is, with V without it and with it, so
+    // a factor of 0.89 is not read as a V to compare with the one beside it
+    vsRow('Haze factor w', vsFactor(vis.haze_factor, ax.v_no_haze, d.V)),
+    vsRow('Canopy factor T', vsFactor(vis.canopy_factor, ax.v_no_canopy, d.V)),
+    vsRow('Looming factor u', vsFactor(vis.loom_factor, ax.v_no_loom, d.V)),
   );
   const s1b = el('div', 'vs-note');
   s1b.textContent = 'The same sum at the two extremes of γ:';
@@ -2975,11 +2997,41 @@ const rankMeta = { vmax: null };   // from the last response: the filter's scale
 let rankSel = null;                // { key, theme, layers: [], marker }
 let rankLastUpdate = null;          // the status file's last write we acted on
 
-/** The list's area: the drawn box, or what the map shows. */
+/** Container-pixel rectangle -> [west, south, east, north]. */
+function pxToBox(x0, y0, x1, y1) {
+  const a = map.containerPointToLatLng([x0, y0]), b = map.containerPointToLatLng([x1, y1]);
+  return [Math.min(a.lng, b.lng), Math.min(a.lat, b.lat), Math.max(a.lng, b.lng), Math.max(a.lat, b.lat)];
+}
+
+/** The list's area: the drawn box, or what the map actually shows. The map
+ *  runs underneath the left panel, so the part of it the panel covers is
+ *  not in view, and neither is what the cursor card covers (see rankExcl). */
 function rankBbox() {
   if (rankState.place === 'box' && rankState.box) return rankState.box;
-  const b = map.getBounds();
-  return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+  const size = map.getSize();
+  const panel = $('panel');
+  const mapLeft = map.getContainer().getBoundingClientRect().left;
+  const left = panel.classList.contains('hidden') ? 0
+    : Math.max(0, panel.getBoundingClientRect().right - mapLeft);
+  return pxToBox(Math.min(left, size.x - 1), 0, size.x, size.y);
+}
+
+/** Map areas covered by a floating card: [[w, s, e, n], ...]. */
+function rankExcl() {
+  if (rankState.place === 'box') return [];
+  const out = [];
+  const mr = map.getContainer().getBoundingClientRect();
+  for (const id of ['inspect']) {
+    const e = $(id);
+    if (!e || e.hidden || e.offsetParent === null) continue;
+    const r = e.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    // the card shrinks to a one-line hint when the cursor leaves the map and
+    // grows back when it returns: what it covers is its full height
+    const bottom = r.top + Math.max(r.height, INSPECT_FULL_H);
+    out.push(pxToBox(r.left - mr.left, r.top - mr.top, r.right - mr.left, bottom - mr.top));
+  }
+  return out;
 }
 
 let rankSeq = 0;
@@ -3002,7 +3054,11 @@ async function fetchRank() {
     sort: rankState.sort, dir: String(rankState.dir), limit: String(rankState.shown),
   });
   if (rankState.q) p.set('q', rankState.q);
-  else p.set('bbox', rankBbox().map((v) => v.toFixed(5)).join(','));
+  else {
+    p.set('bbox', rankBbox().map((v) => v.toFixed(5)).join(','));
+    const ex = rankExcl();
+    if (ex.length) p.set('excl', ex.map((x) => x.map((v) => v.toFixed(5)).join(',')).join(';'));
+  }
   if (rankSel) p.set('pin', rankSel.key);
   let res;
   try {

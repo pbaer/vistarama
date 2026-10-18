@@ -672,6 +672,55 @@ def derive_densities(lc_path: Path, out_dir: Path) -> dict[str, Path]:
 
 
 # --------------------------------------------------------------------------
+# sea
+# --------------------------------------------------------------------------
+
+# Water at sea level: WorldCover's water class where the DEM is within this
+# of 0 m. Lakes sit higher (Lake Washington ~6 m) and stay land here, drawn
+# by their own polygons; the sea, which OSM maps only as coastline ways, gets
+# this mask instead. Over Puget Sound 3DEP holds ~-0.4 m, and region.py set
+# the open sea it has no tile for to exactly 0.
+SEA_MAX_ELEV_M = 2.0
+
+
+def derive_sea(lc_path: Path, dem_path: Path, dst: Path, block: int = 4096) -> Path | None:
+    """derived/sea.tif on the land-cover grid: 1 where the sea is, 0 elsewhere."""
+    if dst.exists():
+        log(f"skip sea (present)")
+        return dst
+    from rasterio.windows import from_bounds
+    with rasterio.open(lc_path) as lc, rasterio.open(dem_path) as dem:
+        profile = {"driver": "GTiff", "dtype": "uint8", "count": 1, "nodata": 0,
+                   "width": lc.width, "height": lc.height, "crs": lc.crs,
+                   "transform": lc.transform, **compress_opts("uint8")}
+        part = dst.with_name(dst.stem + ".part.tif")
+        n = 0
+        with rasterio.open(part, "w", **profile) as out:
+            for r0 in range(0, lc.height, block):
+                for c0 in range(0, lc.width, block):
+                    win = rasterio.windows.Window(c0, r0, min(block, lc.width - c0), min(block, lc.height - r0))
+                    cls = lc.read(1, window=win)
+                    water = cls == 80
+                    if not water.any():
+                        continue
+                    b = rasterio.windows.bounds(win, lc.transform)
+                    z = dem.read(1, window=from_bounds(*b, transform=dem.transform),
+                                 out_shape=cls.shape, boundless=True,
+                                 fill_value=dem.nodata if dem.nodata is not None else -1e9,
+                                 resampling=Resampling.nearest)
+                    ok = np.isfinite(z) & (z > -1e5)
+                    if dem.nodata is not None:
+                        ok &= z != dem.nodata
+                    sea = water & ok & (z <= SEA_MAX_ELEV_M)
+                    if sea.any():
+                        out.write(sea.astype(np.uint8), 1, window=win)
+                        n += int(sea.sum())
+    part.replace(dst)
+    log(f"derive sea.tif  {n * abs(profile['transform'].a) ** 2 / 1e6:,.0f} km² of sea")
+    return dst
+
+
+# --------------------------------------------------------------------------
 # vectors: zoom-tiered simplification
 # --------------------------------------------------------------------------
 
@@ -688,16 +737,19 @@ def _peak_rank(props: dict) -> float:
 VECTOR_LOD = {
     # Trails start at mid: zoomed out they are a dense red haze that obscures
     # the terrain without being individually readable.
-    "trails":      [("mid", 0.0004), ("high", 0.00005)],
-    "roads":       [("low", 0.002), ("mid", 0.0004), ("high", 0.00005)],
+    # ... and get a "full" tier like roads: every short park path only from z14
+    "trails":      [("mid", 0.0004), ("high", 0.0001), ("full", 0.00005)],
+    # Roads get a fourth tier: residential streets only from z14 ("full"),
+    # see TIER_CLASS_KEEP. Other themes have no "full" tier, and the viewer
+    # falls back to their finest one.
+    "roads":       [("low", 0.002), ("mid", 0.0004), ("high", 0.0001), ("full", 0.00005)],
     "water_lines": [("low", 0.002), ("mid", 0.0004), ("high", 0.00005)],
     "water_areas": [("low", 0.001), ("mid", 0.0002), ("high", 0.00005)],
     "glaciers":    [("low", 0.001), ("high", 0.00005)],
     "peaks":       [("low", 0.0), ("mid", 0.0), ("high", 0.0)],
     "passes":      [("high", 0.0)],
-    # both from the POI download, split by featurescore.poi_kind
+    # from the POI download, camps only (featurescore.poi_kind)
     "camps":       [("high", 0.0)],
-    "viewpoints":  [("high", 0.0)],
     "protected":   [("low", 0.001), ("high", 0.0001)],
 }
 
@@ -712,20 +764,86 @@ VECTOR_LOD = {
 TIER_MIN_EXTENT: dict[str, float] = {"low": 0.0035, "mid": 0.0007, "high": 0.0}
 
 # Classes a theme may keep at a given tier, on top of the extent test. Roads
-# stay visible at every zoom because they are how you orient, but at "low" only
-# the through routes survive — residential streets and service roads there are
-# a grey wash that hides the terrain and cannot be told apart anyway.
+# stay visible at every zoom because they are how you orient, but each tier out
+# keeps only the roads that still mean something at that scale, and the map
+# draws far less: across western Washington the old "low" tier (through
+# routes down to secondary) was 41k ways and 20 MB, and the Seattle cell of
+# the "high" tier alone was 35 MB.
+#   low  (<= z9)   motorway, trunk, primary: the highways you navigate by
+#   mid  (z10-11)  + secondary, tertiary and the motorway/trunk links
+#   high (z12-13)  + the remaining links and unclassified (forest roads)
+#   full (>= z14)  everything, residential streets included
+# Rivers likewise: zoomed out, only waterway=river, not every named creek.
+_ROADS_LOW = {"motorway", "trunk", "primary"}
+_ROADS_MID = _ROADS_LOW | {"secondary", "tertiary", "motorway_link", "trunk_link"}
+_ROADS_HIGH = _ROADS_MID | {"primary_link", "secondary_link", "tertiary_link", "unclassified"}
 TIER_CLASS_KEEP: dict[str, dict[str, set[str]]] = {
-    "roads": {"low": {"motorway", "motorway_link", "trunk", "trunk_link",
-                      "primary", "primary_link", "secondary", "secondary_link"}},
+    "roads": {"low": _ROADS_LOW, "mid": _ROADS_MID, "high": _ROADS_HIGH},
+    "water_lines": {"low": {"river"}, "mid": {"river", "canal"}},
 }
+
+# Per-theme extent floors that override TIER_MIN_EXTENT. Trails at "mid"
+# (z10-11) drop the unnamed short paths of every city park, which at that
+# zoom are specks: ~0.004 deg is ~350 m.
+TIER_MIN_EXTENT_THEME: dict[str, dict[str, float]] = {"trails": {"mid": 0.004, "high": 0.0015}}
+
+# At the coarse tiers a feature keeps only the tags the viewer reads (styling,
+# the hover card); OSM ways carry a dozen more (tiger:*, lanes, sources...)
+# that made up much of each file. "high" and "full" keep every tag, for the
+# Alt-click tag table.
+TIER_SLIM = {"low", "mid"}
+# Roads and rivers are drawn rather than read, so they slim through "high"
+# too: Seattle's z12-13 road cell was 6 MB, most of it tags.
+TIER_SLIM_THEME = {"roads": {"low", "mid", "high"}, "water_lines": {"low", "mid", "high"}}
+VIEWER_TAGS = {
+    "name", "ref", "highway", "waterway", "natural", "water", "landuse", "leisure",
+    "boundary", "protect_class", "protection_title", "operator", "tourism", "amenity",
+    "ele", "prominence", "mountain_pass", "intermittent", "sac_scale", "surface",
+    "trail_visibility", "access", "tracktype", "lanes", "maxspeed", "tunnel", "bridge",
+    "fee", "backcountry", "reservation", "drinking_water", "toilets", "volcano:status",
+    "reservoir_type",
+}
+
+# Roads at the coarse tiers are drawn, not inspected, and OSM splits every
+# highway into hundreds of short ways (at each bridge, speed change, lane
+# change). There, ways sharing class, ref and name are merged into
+# continuous lines first, which is most of what made the low tier 19k
+# features.
+TIER_MERGE = {"roads": {"low", "mid"}}
+
+
+def _merge_lines(feats: list[dict]) -> list[dict]:
+    """Ways with the same highway class, ref and name, joined end to end."""
+    from shapely.geometry import MultiLineString, mapping, shape
+    from shapely.ops import linemerge
+    groups: dict[tuple, list] = {}
+    for f in feats:
+        g = f.get("geometry") or {}
+        if g.get("type") not in ("LineString", "MultiLineString"):
+            continue
+        p = f.get("properties") or {}
+        key = (p.get("highway"), p.get("ref"), p.get("name"))
+        groups.setdefault(key, []).append(shape(g))
+    out = []
+    for (hw, ref, name), geoms in groups.items():
+        lines = []
+        for gg in geoms:
+            lines.extend(gg.geoms if gg.geom_type == "MultiLineString" else [gg])
+        merged = linemerge(MultiLineString(lines)) if len(lines) > 1 else lines[0]
+        parts = merged.geoms if merged.geom_type == "MultiLineString" else [merged]
+        props = {k: v for k, v in (("highway", hw), ("ref", ref), ("name", name)) if v}
+        for part in parts:
+            out.append({"type": "Feature", "properties": props, "geometry": mapping(part)})
+    return out
+# the tag each theme's classes come from
+TIER_CLASS_KEY = {"roads": "highway", "water_lines": "waterway"}
 
 
 def _tier_class_ok(theme: str, tier: str, props: dict) -> bool:
     keep = TIER_CLASS_KEEP.get(theme, {}).get(tier)
     if not keep:
         return True
-    return (props or {}).get("highway") in keep
+    return (props or {}).get(TIER_CLASS_KEY.get(theme, "highway")) in keep
 
 # Points have no extent, so they still need ranking to stay legible when
 # zoomed out. Peaks rank by elevation; everything else is small enough to ship
@@ -743,11 +861,14 @@ def _bbox_diag(geom: dict) -> float:
 # Tiers larger than this get split into a spatial grid, so that zooming in
 # fetches only the cells on screen instead of the whole AOI. LOD alone fixes
 # the zoomed-out case; gridding fixes the zoomed-in one.
-# 5 MB keeps the feature-capped 'low'/'mid' tiers as single files (one request
-# covering the whole AOI, which is what you're looking at anyway) and grids
-# only the uncapped 'high' tiers.
-GRID_SPLIT_BYTES = 5_000_000
-GRID_COLS, GRID_ROWS = 6, 4
+#
+# The grid is sized in degrees per tier, not as a fixed count: a fixed 6x4
+# over western Washington made cells ~100 km across, and the one over Seattle
+# held 35 MB of roads and 16 MB of trails, all fetched to show a few blocks.
+# Each tier's cell is a fraction of the area a screen shows at that tier's
+# zooms, so a view fetches a handful of cells and little beyond them.
+GRID_SPLIT_BYTES = 2_000_000
+GRID_CELL_DEG = {"low": 1.0, "mid": 0.5, "high": 0.25, "full": 0.125}
 
 
 def _feature_bbox(geom: dict) -> tuple[float, float, float, float]:
@@ -768,7 +889,16 @@ def _feature_bbox(geom: dict) -> tuple[float, float, float, float]:
     return (min(xs), min(ys), max(xs), max(ys))
 
 
-def _split_grid(feats: list[dict], bounds: tuple[float, float, float, float]):
+def _grid_shape(tier: str, bounds) -> tuple[int, int]:
+    """(cols, rows) for a tier's grid over bounds: cells of about
+    GRID_CELL_DEG[tier] degrees."""
+    w, s, e, n = bounds
+    cell = GRID_CELL_DEG.get(tier, 0.25)
+    return max(1, math.ceil((e - w) / cell - 1e-9)), max(1, math.ceil((n - s) / cell - 1e-9))
+
+
+def _split_grid(feats: list[dict], bounds: tuple[float, float, float, float],
+                cols: int, rows: int):
     """Bucket features into a cols x rows grid by bbox overlap.
 
     A feature spanning several cells is written into each of them. That costs a
@@ -776,15 +906,15 @@ def _split_grid(feats: list[dict], bounds: tuple[float, float, float, float]):
     both the writer and the popup data.
     """
     w, s, e, n = bounds
-    dx = (e - w) / GRID_COLS
-    dy = (n - s) / GRID_ROWS
+    dx = (e - w) / cols
+    dy = (n - s) / rows
     cells: dict[tuple[int, int], list[dict]] = {}
     for f in feats:
         fw, fs, fe, fn = _feature_bbox(f["geometry"])
-        c0 = max(0, min(GRID_COLS - 1, int((fw - w) / dx))) if dx else 0
-        c1 = max(0, min(GRID_COLS - 1, int((fe - w) / dx))) if dx else 0
-        r0 = max(0, min(GRID_ROWS - 1, int((fs - s) / dy))) if dy else 0
-        r1 = max(0, min(GRID_ROWS - 1, int((fn - s) / dy))) if dy else 0
+        c0 = max(0, min(cols - 1, int((fw - w) / dx))) if dx else 0
+        c1 = max(0, min(cols - 1, int((fe - w) / dx))) if dx else 0
+        r0 = max(0, min(rows - 1, int((fs - s) / dy))) if dy else 0
+        r1 = max(0, min(rows - 1, int((fn - s) / dy))) if dy else 0
         for r in range(r0, r1 + 1):
             for c in range(c0, c1 + 1):
                 cells.setdefault((r, c), []).append(f)
@@ -805,6 +935,10 @@ def build_vector_lod(slug: str, out_dir: Path,
     from shapely.geometry import mapping, shape
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    # a rebuild can change tiers and grids; files from the old layout would
+    # otherwise sit there unused
+    for old in out_dir.glob("*.geojson"):
+        old.unlink()
     manifest = {}
     import featurescore
     for theme, tiers in VECTOR_LOD.items():
@@ -814,13 +948,10 @@ def build_vector_lod(slug: str, out_dir: Path,
         gj = json.loads(src.read_text(encoding="utf-8"))
         feats = gj.get("features", [])
         if theme == "camps":
-            # huts, campsites and trail shelters, with springs and drinking
-            # water alongside; bus and picnic shelters belong to neither
+            # huts, campsites and trail shelters; bus and picnic shelters are
+            # not somewhere to stay
             feats = [f for f in feats
-                     if featurescore.poi_kind(f.get("properties") or {}) in ("camp", "water")]
-        elif theme == "viewpoints":
-            feats = [f for f in feats
-                     if featurescore.poi_kind(f.get("properties") or {}) == "viewpoint"]
+                     if featurescore.poi_kind(f.get("properties") or {}) == "camp"]
         if not feats:
             log(f"vectors {theme}: empty, skipping")
             continue
@@ -833,9 +964,8 @@ def build_vector_lod(slug: str, out_dir: Path,
         # simplified tiers report the same numbers as the full one.
         extra_info = {}
         if theme == "camps":
-            # the ones featurescore scores (not the water sources)
             for f in feats:
-                if f.get("id") and featurescore.poi_kind(f.get("properties") or {}) == "camp":
+                if f.get("id"):
                     extra_info[f["id"]] = {"camp": 1}
         if theme == "water_areas":
             # lakes big enough to score carry their area, so the viewer only
@@ -865,7 +995,8 @@ def build_vector_lod(slug: str, out_dir: Path,
         entries = []
         for tier, tol in tiers:
             point_limit = POINT_TIER_LIMIT.get(theme, {}).get(tier)
-            threshold = TIER_MIN_EXTENT.get(tier, 0.0)
+            threshold = TIER_MIN_EXTENT_THEME.get(theme, {}).get(
+                tier, TIER_MIN_EXTENT.get(tier, 0.0))
             if point_limit and len(feats) > point_limit:
                 sel = sorted(
                     feats, key=lambda f: -_peak_rank(f["properties"] or {})
@@ -883,6 +1014,9 @@ def build_vector_lod(slug: str, out_dir: Path,
             if TIER_CLASS_KEEP.get(theme, {}).get(tier):
                 sel = [f for f in sel
                        if _tier_class_ok(theme, tier, f["properties"] or {})]
+            if tier in TIER_MERGE.get(theme, ()):
+                sel = _merge_lines(sel)
+            slim = tier in TIER_SLIM_THEME.get(theme, TIER_SLIM)
 
             out_feats = []
             for f in sel:
@@ -895,9 +1029,12 @@ def build_vector_lod(slug: str, out_dir: Path,
                         g = mapping(s)
                     except Exception:  # noqa: BLE001
                         pass
+                props = f["properties"] or {}
+                if slim:
+                    props = {k: v for k, v in props.items() if k in VIEWER_TAGS}
                 feat = {
                     "type": "Feature",
-                    "properties": f["properties"],
+                    "properties": props,
                     "geometry": _round_coords(dict(g)),
                 }
                 # the OSM id ("way/123", "node/456"): the viewer keys stored
@@ -916,8 +1053,20 @@ def build_vector_lod(slug: str, out_dir: Path,
                     separators=(",", ":"))
 
             payload = dump(out_feats)
+            cells = None
             if len(payload) > GRID_SPLIT_BYTES:
-                cells = _split_grid(out_feats, bounds)
+                cols, rows = _grid_shape(tier, bounds)
+                cells = _split_grid(out_feats, bounds, cols, rows)
+                # Big polygons (a national forest) land in every cell they
+                # touch, so a grid can leave every cell nearly as big as the
+                # whole: protected areas went from one 4 MB file to 49 MB of
+                # cells. What matters is what a view fetches, a few cells, so
+                # keep one file when the largest cell is over a quarter of it,
+                # or the copies add up to more than eight times it.
+                sizes = [len(dump(cf)) for cf in cells.values()]
+                if 4 * max(sizes) > len(payload) or sum(sizes) > 8 * len(payload):
+                    cells = None
+            if cells:
                 total = 0
                 names = []
                 for (r, c), cf in sorted(cells.items()):
@@ -929,7 +1078,7 @@ def build_vector_lod(slug: str, out_dir: Path,
                 entries.append({
                     "tier": tier,
                     "pattern": f"vectors/{theme}.{tier}.{{cell}}.geojson",
-                    "grid": {"cols": GRID_COLS, "rows": GRID_ROWS,
+                    "grid": {"cols": cols, "rows": rows,
                              "bounds": list(bounds), "cells": names},
                     "features": len(out_feats),
                     "bytes": total,
@@ -1001,7 +1150,11 @@ def main() -> int:
         imagery_s2 = interim / "imagery_s2_5070.tif"
     # a region's NAIP is a VRT over its work tiles (imagery.write_naip_vrt)
     imagery_naip = interim / "imagery_naip_5070.vrt"
-    if not imagery_naip.exists():
+    if "--skip-naip" in sys.argv:
+        # the NAIP build is still running: its interim VRT must not be tiled
+        # (and marked complete) half done
+        imagery_naip = None
+    elif not imagery_naip.exists():
         imagery_naip = interim / "imagery_naip_5070.tif"
         if imagery_naip.exists():
             add_overviews(imagery_naip)
@@ -1030,6 +1183,7 @@ def main() -> int:
         layers["landcover"] = lc
         if "densities" not in skip:
             layers.update(derive_densities(lc, derived))
+        layers["sea"] = derive_sea(Path(lc), Path(dem), derived / "sea.tif")
 
     # ---- web tiles -----------------------------------------------------
     manifest = {
@@ -1039,7 +1193,8 @@ def main() -> int:
         "built": int(time.time()),
         "aoi": {"slug": slug, "name": aoi["name"],
                 "core": aoi["core"], "buffered": aoi["buffered"],
-                "vector": aoi.get("vector")},
+                "vector": aoi.get("vector"), "buffer_km": aoi.get("buffer_km"),
+                "core_polygon": aoi.get("core_polygon")},
         "raster_layers": [], "vector_layers": {},
     }
 
@@ -1159,6 +1314,14 @@ def main() -> int:
              description="Fraction of ground built on, 100 m radius at 10 m"),
     ]
 
+    # The sea, above the terrain layers and below the imagery (whose own
+    # photographs of the water are better than a flat colour when it is on).
+    specs.append(dict(
+        id="sea", title="Sea", layer="sea", categorical=True,
+        palette={1: cm.WATER_BLUE}, zmin=6, zmax=14, resampling=Resampling.mode,
+        units="", description="Water at sea level: WorldCover water within 2 m of 0 m",
+        legend=[{"label": "Sea", "color": cm.WATER_BLUE}]))
+
     # Imagery layers are appended rather than declared inline above, because
     # they are the only ones that may be absent and the only ones whose extent
     # is not the buffered box — NAIP is US-only and downloaded over the core.
@@ -1194,8 +1357,8 @@ def main() -> int:
 
     def make_colorize(spec):
         if spec.get("categorical"):
-            return lambda v, m: cm.categorical_indexed(
-                v.astype(np.int32), cm.WORLDCOVER)
+            pal = spec.get("palette", cm.WORLDCOVER)
+            return lambda v, m: cm.categorical_indexed(v.astype(np.int32), pal)
         ramp, lo, hi = spec["ramp"], spec["vmin"], spec["vmax"]
         return lambda v, m: cm.ramp_indexed(v, m, ramp, lo, hi)
 

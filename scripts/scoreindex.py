@@ -104,7 +104,8 @@ def _public(r: dict, keep_ways: bool = False) -> dict:
 
 def query(slug: str, *, bbox=None, q: str = "", type_: str = "trails", named: bool = True,
           min_len: float = 0.0, vmode: str = "avg", vmin: float = 0.0, sort: str = "V",
-          direction: int = -1, offset: int = 0, limit: int = 200, pin: str | None = None) -> dict:
+          direction: int = -1, offset: int = 0, limit: int = 200, pin: str | None = None,
+          excl=None) -> dict:
     idx = _index(slug)
     n = len(idx.items)
     val = idx.value(vmode)
@@ -127,6 +128,11 @@ def query(slug: str, *, bbox=None, q: str = "", type_: str = "trails", named: bo
         w, s, e, nn = bbox
         with np.errstate(invalid="ignore"):
             m &= (idx.lon >= w) & (idx.lon <= e) & (idx.lat >= s) & (idx.lat <= nn)
+        # parts of the area the viewer covers with a card (the cursor card):
+        # on the map but not visible, so not "in view"
+        for xw, xs, xe, xn in excl or []:
+            with np.errstate(invalid="ignore"):
+                m &= ~((idx.lon >= xw) & (idx.lon <= xe) & (idx.lat >= xs) & (idx.lat <= xn))
     sel = np.flatnonzero(m)
     if sort == "name":
         key = idx.name_rank[sel].astype(np.float64)

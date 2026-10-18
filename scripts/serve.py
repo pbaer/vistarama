@@ -195,7 +195,9 @@ class Handler(SimpleHTTPRequestHandler):
                     min_len=float(q.get("min_len", 0)), vmode=q.get("vmode", "avg"),
                     vmin=float(q.get("vmin", 0)), sort=q.get("sort", "V"),
                     direction=int(q.get("dir", -1)), offset=int(q.get("offset", 0)),
-                    limit=min(5000, int(q.get("limit", 200))), pin=q.get("pin") or None))
+                    limit=min(5000, int(q.get("limit", 200))), pin=q.get("pin") or None,
+                    excl=[b for b in (scoreindex.parse_bbox(x) for x in
+                                      q.get("excl", "").split(";") if x) if b]))
             except FileNotFoundError:
                 return self._json({"total": 0, "rows": [], "scored": 0, "vf_pass": 0,
                                    "vmax": {"avg": 0, "best": 0}})
@@ -527,12 +529,38 @@ class Handler(SimpleHTTPRequestHandler):
         sys.stderr.write(f"{self.address_string()} {msg}\n")
 
 
+def _warm() -> None:
+    """Load each AOI's DEM and land cover in the background at start-up.
+
+    The first view score after a restart otherwise pays for them: ~6 s to
+    read a region's DEM and ~1 s for its land cover on the DEM grid (both are
+    then cached for the life of the process), on top of the ~3 s march."""
+    import time
+    import panorama
+    import vscore
+    from aoi import AOI_DIR
+    for f in sorted(AOI_DIR.glob("*.json")):
+        interim = DATA / "interim" / f.stem
+        dem, lc = interim / "dem_5070.tif", interim / "landcover_5070.tif"
+        if not dem.exists():
+            continue
+        try:
+            t = time.time()
+            arr, _crs, _tf, bounds, _nd = panorama._read_full(dem)
+            if lc.exists():
+                vscore.landcover_on_dem(lc, dem, bounds, arr.shape)
+            print(f"warm: {f.stem} DEM and land cover loaded in {time.time() - t:.1f} s", flush=True)
+        except Exception as exc:  # noqa: BLE001 - warming is only an optimisation
+            print(f"warm: {f.stem} skipped: {exc}", flush=True)
+
+
 def main() -> int:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     handler = partial(Handler, directory=str(ROOT))
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     print(f"serving {ROOT} at http://127.0.0.1:{port}/  (Ctrl-C to stop)",
           flush=True)
+    threading.Thread(target=_warm, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
