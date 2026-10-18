@@ -28,6 +28,7 @@ import concurrent.futures as cf
 import threading
 import json
 import math
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -40,7 +41,8 @@ from rasterio.merge import merge
 from rasterio.warp import transform_bounds
 from rasterio.windows import Window
 
-ROOT = Path(__file__).resolve().parents[1]
+from aoi import AOI_DIR, DATA
+
 
 HEADERS = {
     "User-Agent": "vistarama/0.1 "
@@ -58,7 +60,20 @@ PC_SAS = "https://planetarycomputer.microsoft.com/api/sas/v1/token/{collection}"
 SEASON = ("07-15", "10-05")
 
 S2_RES = 10.0
-NAIP_RES = 2.0          # native is 0.6 m; see pick_naip_resolution() for why
+# NAIP at its native 0.6 m (the finest Washington has been flown at; 2011-2017
+# were 1 m), stored as JPEG in YCbCr. The source quads are 4-band DEFLATE,
+# which barely compresses photographs (a 2023 quad is 458 MB against 442 MB
+# raw), so the mosaic is where the size is won: JPEG at this quality is a
+# small fraction of the raw size, with losses below what the eye picks out in
+# terrain texture. An earlier build stored 2 m uncompressed (7.7 GB) and threw
+# away nine-tenths of the detail.
+NAIP_RES = 0.6
+NAIP_JPEG_QUALITY = 88
+# The blob host gives one connection only ~1-2 MB/s, so throughput comes from
+# connections in flight: each quad's share of a strip is fetched as column
+# chunks of NAIP_CHUNK_COLS, each on its own connection.
+NAIP_FETCH_WORKERS = 48
+NAIP_CHUNK_COLS = 2048
 
 # Rows of the destination mosaic built per pass. The full AOI at 10 m is ~1.1 GB
 # as a 3-band uint8 array, which is more than worth holding in memory at once.
@@ -73,7 +88,7 @@ WORKERS = 12
 # long and stdout is not always reachable — a pipe through `tail` buffers the
 # whole run, and a job killed by the machine sleeping leaves nothing behind at
 # all. The log file is the one place progress can always be read from.
-LOG_PATH = ROOT / "data" / "imagery.log"
+LOG_PATH = DATA / "imagery.log"
 
 
 def log(msg: str) -> None:
@@ -232,6 +247,263 @@ def build_s2_mosaic(feats: list, bbox, dst: Path) -> Path:
 
 
 # --------------------------------------------------------------------------
+# Sentinel-2: a seasonal median composite, for areas no single date covers
+# --------------------------------------------------------------------------
+
+# Scene classification (SCL) classes kept as ground: dark areas (2, which is
+# also terrain shadow, so north faces must keep it), vegetation, bare, water,
+# unclassified and snow/ice (11: summer snowfields and glaciers are real).
+# Dropped: no data, saturated, cloud shadow, cloud, thin cirrus.
+S2_SCL_KEEP = np.array([False, False, True, False, True, True, True, True,
+                        False, False, False, True])
+# Clear looks per pixel that make the median stable. Scenes are read clearest
+# first and a block stops reading once every pixel has this many, which in a
+# Cascades summer is after a handful of scenes rather than every one.
+S2_MIN_LOOKS = 7
+# ... on this share of the block's pixels: a few never get there (a summit's
+# cloud cap, glacier ice the classifier calls cloud), and waiting on them read
+# every scene there was. And never more than S2_MAX_SCENES per block.
+S2_LOOKS_SHARE = 0.99
+S2_MAX_SCENES = 24
+S2_COMPOSITE_BLOCK = 2048
+# One warp at a time, single-threaded, and never on a sliver. The composite
+# reads scenes on 16 threads, and GDAL's warper corrupted the heap (Windows
+# fatal exception 0xc0000374, inside rasterio's reproject) every ~150 blocks
+# at 10 m, and within two blocks at 60 m, where reads are decimated and scene
+# edges leave windows of a pixel or two. Serialising alone did not stop it;
+# the warper's own worker threads and the degenerate windows are gone too. A
+# block's warp is ~0.1 s against seconds of network reads.
+_S2_WARP_LOCK = threading.Lock()
+S2_JPEG_QUALITY = 90
+
+
+def _stac_search(url: str, body: dict) -> list:
+    """Every feature of a STAC search, following its paging links."""
+    def post(b):
+        # the public STAC APIs answer a busy moment with 502/504; wait it out
+        for attempt in range(6):
+            try:
+                return _post(url, b)
+            except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as e:
+                if attempt == 5:
+                    raise
+                log(f"STAC search: {type(e).__name__}: {str(e)[:100]}; retrying")
+                time.sleep(10 * 2 ** attempt)
+
+    feats = []
+    while True:
+        page = post(body)
+        feats.extend(page.get("features", []))
+        nxt = next((l for l in page.get("links", []) if l.get("rel") == "next"), None)
+        if not nxt:
+            return feats
+        if nxt.get("body"):
+            body = {**body, **nxt["body"]}
+            continue
+        # GET-style paging: follow hrefs until there is no next link
+        href = nxt["href"]
+        while href:
+            got = requests.get(href, headers=HEADERS, timeout=TIMEOUT)
+            got.raise_for_status()
+            page = got.json()
+            feats.extend(page.get("features", []))
+            nxt = next((l for l in page.get("links", []) if l.get("rel") == "next"), None)
+            href = nxt["href"] if nxt else None
+        return feats
+
+
+def build_s2_composite(bbox, dst: Path, res: float, year: int,
+                       max_cloud: float = 50.0, quality: int = S2_JPEG_QUALITY) -> Path:
+    """A per-pixel median of clear Sentinel-2 looks over one season, in
+    EPSG:5070 at `res`, JPEG/YCbCr.
+
+    One date cannot cover western Washington cloud-free, and a mosaic of
+    dates puts a seam wherever two meet; the median of each pixel's clear
+    looks has none. The `visual` (true-colour) asset is used, the same
+    product as the single-date Alpine Lakes layer, with each scene's SCL band
+    as the cloud mask. Built in blocks; each block is written once and the
+    file closed after it (see build_naip_mosaic for why), and a rerun resumes
+    after the last block recorded. Where a pixel has no clear look at all it
+    takes the clearest scene that has data there.
+    """
+    from pyproj import Transformer
+    from rasterio.warp import reproject
+    from shapely.geometry import box as sbox, shape
+
+    if dst.exists():
+        log(f"skip {dst.name} (present)")
+        return dst
+    crs = "EPSG:5070"
+    west, south, east, north = transform_bounds("EPSG:4326", crs, *bbox, densify_pts=21)
+    west, south = math.floor(west / res) * res, math.floor(south / res) * res
+    east, north = math.ceil(east / res) * res, math.ceil(north / res) * res
+    width, height = int(round((east - west) / res)), int(round((north - south) / res))
+    B = S2_COMPOSITE_BLOCK
+    nbx, nby = (width + B - 1) // B, (height + B - 1) // B
+
+    feats = _stac_search(EARTH_SEARCH, {
+        "collections": ["sentinel-2-l2a"], "bbox": list(bbox),
+        "datetime": f"{year}-{SEASON[0]}T00:00:00Z/{year}-{SEASON[1]}T23:59:59Z",
+        "query": {"eo:cloud_cover": {"lt": max_cloud}}, "limit": 100})
+    feats = [f for f in feats if "visual" in f["assets"] and "scl" in f["assets"]]
+    feats.sort(key=lambda f: (f["properties"].get("eo:cloud_cover", 100.0), _nodata_pct(f)))
+    log(f"S2 composite {dst.name}: {width}x{height} @{res:g}m, {nbx}x{nby} blocks, "
+        f"{len(feats)} scenes {year} {SEASON[0]}..{SEASON[1]} under {max_cloud:g}% cloud")
+    to_ll = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    shapes = [shape(f["geometry"]) for f in feats]
+
+    part = dst.with_name(dst.stem + ".part.tif")
+    prog_path = dst.with_name(dst.stem + ".progress.json")
+    settings = {"res": res, "width": width, "height": height, "block": B, "year": year,
+                "max_cloud": max_cloud, "quality": quality}
+    done = 0
+    if part.exists() and prog_path.exists():
+        prog = json.loads(prog_path.read_text(encoding="utf-8"))
+        if prog.get("settings") == settings:
+            done = prog["blocks_done"]
+            log(f"S2 composite: resuming at block {done} of {nbx * nby}")
+    if done == 0:
+        part.unlink(missing_ok=True)
+        profile = {"driver": "GTiff", "dtype": "uint8", "count": 3, "nodata": 0,
+                   "width": width, "height": height, "crs": crs,
+                   "transform": rasterio.transform.from_origin(west, north, res, res),
+                   "tiled": True, "blockxsize": 512, "blockysize": 512,
+                   "compress": "JPEG", "photometric": "YCBCR", "jpeg_quality": quality,
+                   "BIGTIFF": "YES"}
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(part, "w", **profile):
+            pass
+
+    def read_scene(f, bx0, by0, bw, bh):
+        """(rgb, keep, has) of one scene on the block grid, or None if it has
+        nothing there."""
+        dst_tf = rasterio.transform.from_origin(west + bx0 * res, north - by0 * res, res, res)
+        b_w, b_n = west + bx0 * res, north - by0 * res
+        b_e, b_s = b_w + bw * res, b_n - bh * res
+        out = {}
+        for key, bands in (("visual", [1, 2, 3]), ("scl", [1])):
+            href = f["assets"][key]["href"].replace("https://", "/vsicurl/https://")
+            for attempt in range(5):
+                try:
+                    with rasterio.open(href) as sds:
+                        bw_, bs_, be_, bn_ = transform_bounds(crs, sds.crs, b_w, b_s, b_e, b_n,
+                                                              densify_pts=21)
+                        m = 2 * sds.res[0]
+                        win = rasterio.windows.from_bounds(bw_ - m, bs_ - m, be_ + m, bn_ + m,
+                                                           sds.transform)
+                        win = win.round_offsets().round_lengths()
+                        full = Window(0, 0, sds.width, sds.height)
+                        if not rasterio.windows.intersect(win, full):
+                            return None
+                        win = win.intersection(full)
+                        dec = max(1, int(res / sds.res[0] + 1e-6))
+                        shp = (len(bands), max(1, int(win.height) // dec),
+                               max(1, int(win.width) // dec))
+                        # a sliver of a scene at its edge: nothing worth a
+                        # warp, and degenerate warps are where GDAL fell over
+                        if shp[1] < 2 or shp[2] < 2:
+                            return None
+                        src = sds.read(indexes=bands, window=win, out_shape=shp,
+                                       resampling=Resampling.average if key == "visual"
+                                       else Resampling.nearest)
+                        src_tf = sds.window_transform(win) * rasterio.Affine.scale(
+                            win.width / shp[2], win.height / shp[1])
+                        arr = np.zeros((len(bands), bh, bw), dtype=np.uint8)
+                        with _S2_WARP_LOCK:
+                            reproject(source=src, destination=arr, src_transform=src_tf,
+                                      src_crs=sds.crs, src_nodata=0, dst_transform=dst_tf,
+                                      dst_crs=crs, dst_nodata=0,
+                                      resampling=Resampling.bilinear if key == "visual"
+                                      else Resampling.nearest, num_threads=1)
+                        out[key] = arr
+                    break
+                except Exception as e:  # noqa: BLE001 - retried, then the scene is skipped
+                    if attempt == 4:
+                        log(f"  S2 {f['id']} {key}: giving up: {type(e).__name__}: {str(e)[:120]}")
+                        return None
+                    time.sleep(3 * 2 ** attempt)
+        rgb, scl = out["visual"], out["scl"][0]
+        has = rgb.any(axis=0)
+        if not has.any():
+            return None
+        keep = has & S2_SCL_KEEP[np.minimum(scl, 11)]
+        return rgb, keep, has
+
+    t0 = time.time()
+    with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", GDAL_HTTP_MULTIRANGE="YES",
+                      GDAL_HTTP_MERGE_CONSECUTIVE_RANGES="YES", GDAL_CACHEMAX=1024), \
+            cf.ThreadPoolExecutor(16) as ex:
+        for k in range(done, nbx * nby):
+            by, bx = divmod(k, nbx)
+            bx0, by0 = bx * B, by * B
+            bw, bh = min(B, width - bx0), min(B, height - by0)
+            # the block's footprint in lon/lat, to pick the scenes that reach it
+            xs = [west + bx0 * res, west + (bx0 + bw) * res]
+            ys = [north - (by0 + bh) * res, north - by0 * res]
+            lon, lat = to_ll.transform([xs[0], xs[1], xs[1], xs[0]],
+                                       [ys[0], ys[0], ys[1], ys[1]])
+            foot = sbox(min(lon), min(lat), max(lon), max(lat))
+            cands = [f for f, sh in zip(feats, shapes) if sh.intersects(foot)]
+            stack, keeps = [], []
+            fallback = np.zeros((3, bh, bw), dtype=np.uint8)
+            fb_has = np.zeros((bh, bw), dtype=bool)
+            looks = np.zeros((bh, bw), dtype=np.uint16)
+            read = 0
+            # clearest first, eight at a time, until nearly every pixel with
+            # data has S2_MIN_LOOKS clear looks or the scenes run out
+            for i in range(0, len(cands), 8):
+                for got in ex.map(lambda f: read_scene(f, bx0, by0, bw, bh), cands[i:i + 8]):
+                    read += 1
+                    if got is None:
+                        continue
+                    rgb, keep, has = got
+                    fill = has & ~fb_has
+                    fallback[:, fill] = rgb[:, fill]
+                    fb_has |= has
+                    if keep.any():
+                        stack.append(rgb)
+                        keeps.append(keep)
+                        looks += keep
+                if read >= S2_MAX_SCENES or (fb_has.any() and np.mean(
+                        looks[fb_has] >= S2_MIN_LOOKS) >= S2_LOOKS_SHARE):
+                    break
+            out = fallback
+            if stack:
+                st = np.stack(stack)                              # n, 3, h, w
+                kp = np.stack(keeps)                              # n, h, w
+                n = kp.sum(axis=0)
+                st = np.where(kp[:, None], st, np.uint8(255))     # invalid sorts last
+                st.sort(axis=0)
+                idx = (np.maximum(n.astype(np.int64), 1) - 1) // 2
+                med = np.take_along_axis(st, np.broadcast_to(idx, (1, 3) + idx.shape), axis=0)[0]
+                out = np.where(n[None] > 0, med, fallback).astype(np.uint8)
+            data = out.any(axis=0)
+            out[:, data] = np.maximum(out[:, data], 1)
+            with rasterio.open(part, "r+") as dsw:
+                dsw.write(out, window=Window(bx0, by0, bw, bh))
+            prog_path.write_text(json.dumps({"settings": settings, "blocks_done": k + 1}),
+                                 encoding="utf-8")
+            el = time.time() - t0
+            left = el / (k + 1 - done) * (nbx * nby - k - 1)
+            med_looks = int(np.median(looks[fb_has])) if fb_has.any() else 0
+            log(f"  block {k + 1}/{nbx * nby}: {read} of {len(cands)} scenes read, "
+                f"median {med_looks} clear looks, {data.mean():.0%} data, "
+                f"{el / 60:.1f} min, ~{left / 60:.0f} min left")
+    log("S2 composite: building overviews")
+    with rasterio.Env(COMPRESS_OVERVIEW="JPEG", PHOTOMETRIC_OVERVIEW="YCBCR",
+                      JPEG_QUALITY_OVERVIEW=str(quality), INTERLEAVE_OVERVIEW="PIXEL",
+                      GDAL_NUM_THREADS="ALL_CPUS", BIGTIFF_OVERVIEW="YES"):
+        with rasterio.open(part, "r+") as ds:
+            ds.build_overviews([2, 4, 8, 16, 32, 64], Resampling.average)
+            ds.update_tags(ns="rio_overview", resampling="average")
+    part.replace(dst)
+    prog_path.unlink(missing_ok=True)
+    log(f"S2 composite complete: {dst.name}, {dst.stat().st_size / 1e9:.2f} GB, "
+        f"{(time.time() - t0) / 60:.0f} min")
+    return dst
+
+
+# --------------------------------------------------------------------------
 # NAIP
 # --------------------------------------------------------------------------
 
@@ -239,27 +511,55 @@ _TOKENS: dict = {}
 _TOKEN_LOCK = threading.Lock()
 
 
-def pc_token(collection: str, force: bool = False) -> str:
+def pc_token(collection: str, failed: str | None = None) -> str:
     """A currently-valid SAS token, refreshed before it expires.
 
     These tokens last about an hour, and a full NAIP mosaic takes longer than
     that. Fetching one at the start and reusing it meant the back third of the
     run got HTTP 403 — 63 of 187 quads — and because each quad had its own
     except clause the job reported success with a third of the AOI missing.
+
+    The token is kept until five minutes before the expiry the service states.
+    A caller whose read failed passes the token it used as `failed`, and the
+    token is refreshed only if that is still the current one: with 48 workers
+    fetching at once, a token expiring made all of them force a refresh, and
+    the token service answered the flood with HTTP 429 for minutes. Now one
+    failure refreshes, and the rest pick up the new token. A 429 is waited out
+    (for as long as the service says) while holding the lock, so the other
+    workers wait for the same token instead of asking again.
     """
     with _TOKEN_LOCK:
         tok, exp = _TOKENS.get(collection, (None, 0.0))
-        if tok and not force and time.time() < exp:
+        if tok and time.time() < exp and (failed is None or failed != tok):
             return tok
-        r = requests.get(PC_SAS.format(collection=collection),
-                         headers=HEADERS, timeout=TIMEOUT)
+        for attempt in range(12):
+            r = requests.get(PC_SAS.format(collection=collection),
+                             headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code != 429:
+                break
+            wait = 30.0
+            m = re.search(r"in (\d+) seconds", r.text)
+            if m:
+                wait = float(m.group(1)) + 2
+            elif r.headers.get("Retry-After", "").isdigit():
+                wait = float(r.headers["Retry-After"]) + 2
+            log(f"SAS token endpoint rate-limited; waiting {wait:.0f} s")
+            time.sleep(wait)
         r.raise_for_status()
-        tok = r.json().get("token")
+        body = r.json()
+        tok = body.get("token")
         if not tok:
             raise RuntimeError(f"no SAS token in response: {r.text[:200]}")
-        # refresh 10 minutes early rather than trusting the stated expiry
-        _TOKENS[collection] = (tok, time.time() + 50 * 60)
-        log(f"SAS token for {collection} refreshed")
+        exp = time.time() + 45 * 60
+        try:
+            from datetime import datetime
+            stated = datetime.fromisoformat(body["msft:expiry"].replace("Z", "+00:00"))
+            exp = stated.timestamp() - 5 * 60
+        except (KeyError, ValueError):
+            pass
+        _TOKENS[collection] = (tok, exp)
+        log(f"SAS token for {collection} refreshed, valid for "
+            f"{(exp - time.time()) / 60:.0f} min")
         return tok
 
 
@@ -284,10 +584,13 @@ def search_naip(bbox, prefer_years: tuple[int, int] = (2021, 2025)) -> list:
     log(f"NAIP: {len(feats)} quads intersect the bbox")
 
     def rank(f):
+        # finest ground sample first (0.6 m flights over 1 m ones), then
+        # summer, then newest: a 2017 July quad must not beat a 2023 October
+        # one at 0.6 m when the point of the mosaic is resolution
         dt = f["properties"]["datetime"]
         month = int(dt[5:7])
         summer = 0 if 6 <= month <= 9 else 1        # summer first
-        return (summer, -int(dt[:4]))
+        return (float(f["properties"].get("gsd") or 9.9), summer, -int(dt[:4]))
 
     best = {}
     for f in feats:
@@ -304,184 +607,381 @@ def search_naip(bbox, prefer_years: tuple[int, int] = (2021, 2025)) -> list:
     return chosen
 
 
+def _strip_has_data(path: Path, r0: int, r1: int) -> bool:
+    """Whether rows r0..r1 of the mosaic hold any imagery: one row from each
+    512-row band of tiles, first band only (each read decodes a whole row of
+    tiles, so more rows would only repeat the work)."""
+    with rasterio.open(path) as ds:
+        rows = range(r0 + 256, r1, 512) or [r0]
+        for r in rows:
+            if ds.read(1, window=Window(0, r, ds.width, 1)).any():
+                return True
+    return False
+
+
 def build_naip_mosaic(feats: list, bbox, dst: Path, res: float = NAIP_RES,
-                      fill_gaps: bool = False) -> Path:
-    """Warp every NAIP quad into one metric-CRS mosaic at `res`.
+                      quality: int = NAIP_JPEG_QUALITY) -> Path:
+    """Mosaic the NAIP quads into one EPSG:5070 GeoTIFF at `res`, JPEG/YCbCr.
 
-    Reading through the COGs' internal overviews is what makes this affordable:
-    the source is 0.6 m and the target is 2 m, so GDAL fetches the 2.4 m
-    overview level and never transfers the full-resolution pixels. Downloading
-    these quads at native resolution would be ~40 GB for this AOI.
+    Built in strips of STRIP_ROWS rows, top to bottom, and each strip written
+    to the file exactly once. That is what makes a compressed output possible:
+    the earlier build wrote quad by quad into scattered, overlapping windows,
+    and a compressed TIFF cannot do that (GDAL pins every dirty block in memory
+    until it can compress it, or leaves the old copy behind as dead space when
+    a block is rewritten), so it had to be stored uncompressed.
+
+    For each strip, every quad crossing it is read over just that band, at
+    full resolution (or decimated through the COG overviews when `res` is
+    coarser than the source), warped onto the strip, and the quads merged in
+    rank order, each filling only what is still empty. Only the part of the
+    strip inside `bbox` is fetched: the mosaic is a rectangle in EPSG:5070 and
+    the lon/lat box is a slanted quadrilateral inside it, so its corners would
+    be a third of the transfer for imagery nobody looks at. Quads for the next
+    strip download while the current one is merged and written.
+
+    Resumable: the strips done so far are recorded beside the part file, and a
+    rerun continues from the next one. Overviews (JPEG too) are built at the
+    end, then the part file replaces `dst`.
     """
-    if dst.exists() and not fill_gaps:
-        log(f"skip {dst.name} (present)")
-        return dst
-    from rasterio.warp import calculate_default_transform, reproject
+    from rasterio.warp import reproject
+    from shapely.geometry import box as sbox
+    from shapely.ops import transform as stransform
+    from pyproj import Transformer
 
-    token = pc_token("naip")
     crs = "EPSG:5070"
     west, south, east, north = transform_bounds("EPSG:4326", crs, *bbox, densify_pts=21)
     west, south = math.floor(west / res) * res, math.floor(south / res) * res
     east, north = math.ceil(east / res) * res, math.ceil(north / res) * res
     width, height = int(round((east - west) / res)), int(round((north - south) / res))
     transform = rasterio.transform.from_origin(west, north, res, res)
-    log(f"NAIP mosaic {width}x{height} @{res:g}m {crs} from {len(feats)} quads")
+    to5070 = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
+    core = stransform(to5070, sbox(*bbox).segmentize(0.002))
+    n_strips = (height + STRIP_ROWS - 1) // STRIP_ROWS
 
-    # Deliberately UNCOMPRESSED, unlike every other raster the pipeline writes.
-    #
-    # Quads arrive in whatever order the network returns them and land in
-    # scattered windows across a 37500x33500 destination. Writing that into a
-    # DEFLATE TIFF means GDAL cannot flush a block until it can compress it in
-    # order, so it pins every dirty block in the cache instead: measured 7.1 GB
-    # resident with 88 kB actually on disk, heading for an out-of-memory kill.
-    # Uncompressed blocks are evicted straight to disk, so memory stays flat.
-    # The cost is ~3.8 GB on disk for this AOI, which is a fine trade — and the
-    # tiler and the panorama both read it faster for being uncompressed.
+    part = dst.with_name(dst.stem + ".part.tif")
+    prog_path = dst.with_name(dst.stem + ".progress.json")
+    settings = {"res": res, "quality": quality, "width": width, "height": height,
+                "strip_rows": STRIP_ROWS, "quads": sorted(f["id"] for f in feats)}
+    first = 0
+    if part.exists() and prog_path.exists():
+        prog = json.loads(prog_path.read_text(encoding="utf-8"))
+        if prog.get("settings") == settings and prog.get("flushed"):
+            first = prog["strips_done"]
+            # trust the record only if the last strip it names is on disk
+            if first and not _strip_has_data(part, (first - 1) * STRIP_ROWS,
+                                             min(height, first * STRIP_ROWS)):
+                log(f"NAIP: strip {first} is recorded but empty on disk; starting over")
+                first = 0
+            else:
+                log(f"NAIP: resuming at strip {first} of {n_strips}")
+    if first == 0:
+        part.unlink(missing_ok=True)
+    log(f"NAIP mosaic {width}x{height} @{res:g}m {crs}, JPEG q{quality}, "
+        f"{n_strips} strips of {STRIP_ROWS} rows, from {len(feats)} quads")
+
+    # quad footprints in the mosaic CRS, for picking the quads a strip needs
+    foot = {}
+    for f in feats:
+        fw, fs_, fe, fn = f["bbox"]
+        foot[f["id"]] = transform_bounds("EPSG:4326", crs, fw, fs_, fe, fn, densify_pts=21)
+    order = sorted(feats, key=lambda f: (float(f["properties"].get("gsd") or 9.9),
+                                         0 if 6 <= int(f["properties"]["datetime"][5:7]) <= 9 else 1,
+                                         -int(f["properties"]["datetime"][:4]), f["id"]))
+
+    def strip_plan(i):
+        """(rows, columns) of strip i to fill, and the quads that cross it."""
+        r0 = i * STRIP_ROWS
+        r1 = min(height, r0 + STRIP_ROWS)
+        yn, ys = north - r0 * res, north - r1 * res
+        band = core.intersection(sbox(west, ys, east, yn))
+        if band.is_empty:
+            return r0, r1, None, []
+        bx0, _b, bx1, _t = band.bounds
+        c0 = max(0, int((bx0 - west) / res) - 2)
+        c1 = min(width, int((bx1 - west) / res) + 3)
+        xw, xe = west + c0 * res, west + c1 * res
+        quads = [f for f in order
+                 if foot[f["id"]][0] < xe and foot[f["id"]][2] > xw
+                 and foot[f["id"]][1] < yn and foot[f["id"]][3] > ys]
+        return r0, r1, (c0, c1), quads
+
+    def chunks(f, c0, c1):
+        """The strip columns quad f can reach, in NAIP_CHUNK_COLS pieces."""
+        fw, _fs, fe, _fn = foot[f["id"]]
+        qc0 = max(c0, int((fw - west) / res) - 2)
+        qc1 = min(c1, int((fe - west) / res) + 3)
+        return [(a, min(qc1, a + NAIP_CHUNK_COLS)) for a in range(qc0, qc1, NAIP_CHUNK_COLS)]
+
+    def fetch(f, r0, r1, qc0, qc1):
+        """A piece of one quad's share of a strip, warped onto the strip grid:
+        (col0, array) or None. Retried with a fresh token; every failure is
+        logged, so a run that keeps retrying says why."""
+        last = None
+        used = None
+        for attempt in range(8):
+            try:
+                # after a failure, a fresh token if nobody has fetched one yet
+                used = pc_token("naip", failed=used if attempt else None)
+                return _fetch_one(f, r0, r1, qc0, qc1, used)
+            except Exception as e:  # noqa: BLE001 — retried, then raised
+                last = e
+                log(f"  retry {attempt + 1}: {f['id']} rows {r0}-{r1} cols {qc0}-{qc1}: "
+                    f"{type(e).__name__}: {str(e)[:160]}")
+                time.sleep(min(60, 3 * 2 ** attempt))
+        raise RuntimeError(f"{f['id']} strip rows {r0}-{r1}: {type(last).__name__}: {last}")
+
+    def _fetch_one(f, r0, r1, qc0, qc1, token):
+        if qc1 <= qc0:
+            return None
+        dst_tf = rasterio.transform.from_origin(west + qc0 * res, north - r0 * res, res, res)
+        with rasterio.open("/vsicurl/" + f["assets"]["image"]["href"] + "?" + token) as sds:
+            # the source window covering this piece of the strip, with a margin
+            # for the resampling kernel
+            bw, bs, be, bn = transform_bounds(
+                crs, sds.crs, west + qc0 * res, north - r1 * res,
+                west + qc1 * res, north - r0 * res, densify_pts=21)
+            m = 4 * sds.res[0]
+            win = rasterio.windows.from_bounds(bw - m, bs - m, be + m, bn + m, sds.transform)
+            win = win.round_offsets().round_lengths()
+            full = Window(0, 0, sds.width, sds.height)
+            # The footprints that pick quads for a strip are lon/lat boxes, a
+            # little larger than the image, so a piece can miss it entirely.
+            # That is no data, not a failed read (rasterio raises on an empty
+            # intersection, which the retries used to mistake for one).
+            if not rasterio.windows.intersect(win, full):
+                return None
+            win = win.intersection(full)
+            if win.width <= 0 or win.height <= 0:
+                return None
+            dec = max(1, int(res / sds.res[0] + 1e-6))
+            shape = (3, max(1, int(win.height) // dec), max(1, int(win.width) // dec))
+            src = sds.read(indexes=[1, 2, 3], window=win, out_shape=shape,
+                           resampling=Resampling.average)
+            src_tf = sds.window_transform(win) * rasterio.Affine.scale(
+                win.width / shape[2], win.height / shape[1])
+            out = np.zeros((3, r1 - r0, qc1 - qc0), dtype=np.uint8)
+            reproject(source=src, destination=out,
+                      src_transform=src_tf, src_crs=sds.crs, src_nodata=0,
+                      dst_transform=dst_tf, dst_crs=crs, dst_nodata=0,
+                      resampling=Resampling.cubic, num_threads=2)
+        return qc0, out
+
     profile = {
         "driver": "GTiff", "dtype": "uint8", "count": 3, "nodata": 0,
         "width": width, "height": height, "crs": crs, "transform": transform,
         "tiled": True, "blockxsize": 512, "blockysize": 512,
+        "compress": "JPEG", "photometric": "YCBCR", "jpeg_quality": quality,
         "BIGTIFF": "YES",
     }
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(".part.tif")
-    done = 0
-    failed: list[str] = []
-    # "w+", not "w": quads overlap, so each one has to read back what is
-    # already there and fill only the gaps. A "w" dataset raises
-    # "UnsupportedOperation: not readable" on the first read — and because each
-    # quad is wrapped in its own try/except, that failed silently per quad and
-    # produced an empty mosaic rather than an error.
-    # Fetch and warp quads concurrently, write them serially.
-    #
-    # The blob host caps a *single connection* at ~0.8 MB/s, but that is not a
-    # real bandwidth ceiling: measured aggregate was 2.9 MB/s over 4 connections
-    # and 6.7 MB/s over 12. Sequentially this AOI would take hours. Only the
-    # writes are serialised — a GDAL dataset must not be written from two
-    # threads at once — and they are cheap next to the transfers.
-    def fetch(f, retry: bool = True):
-        """Download one quad and warp it into destination-grid pixels."""
-        try:
-            return _fetch_one(f, pc_token("naip"))
-        except Exception as e:  # noqa: BLE001
-            # Retry any read failure with a fresh token, not just a literal
-            # "403": GDAL wraps the real status and most of these surface as
-            # "RasterioIOError: Read failed. See previous exception", which a
-            # 403-only test walked straight past. That left 23 quads missing.
-            if retry:
-                try:
-                    return _fetch_one(f, pc_token("naip", force=True))
-                except Exception:  # noqa: BLE001
-                    raise e from None
-            raise
-
-    def _fetch_one(f, token):
-        with rasterio.open("/vsicurl/" + f["assets"]["image"]["href"] + "?" + token) as s:
-            qw, qs, qe, qn = transform_bounds(s.crs, crs, *s.bounds, densify_pts=21)
-            c0 = max(0, int((qw - west) / res) - 1)
-            r0 = max(0, int((north - qn) / res) - 1)
-            c1 = min(width, int((qe - west) / res) + 2)
-            r1 = min(height, int((north - qs) / res) + 2)
-            if c1 <= c0 or r1 <= r0:
-                return None, None
-            win = Window(c0, r0, c1 - c0, r1 - r0)
-
-            # Decimate on read, then warp the small array. Handing
-            # `rasterio.band(...)` to reproject instead pulls every 0.6 m pixel
-            # over the wire — 150 s per quad — because reproject reads the band
-            # at full resolution. `out_shape` is what makes GDAL serve the
-            # request from the COG's internal overview pyramid, which is the
-            # entire reason these files are COGs.
-            dec = max(1, int(res / s.res[0]))
-            sh, sw = max(1, s.height // dec), max(1, s.width // dec)
-            src_arr = s.read(indexes=[1, 2, 3], out_shape=(3, sh, sw),
-                             resampling=Resampling.average)
-            src_tf = s.transform * rasterio.Affine.scale(
-                s.width / sw, s.height / sh)
-
-            dest = np.zeros((3, r1 - r0, c1 - c0), dtype=np.uint8)
-            for b in range(3):
-                reproject(
-                    source=src_arr[b], destination=dest[b],
-                    src_transform=src_tf, src_crs=s.crs, src_nodata=0,
-                    dst_transform=rasterio.windows.transform(win, transform),
-                    dst_crs=crs, dst_nodata=0,
-                    resampling=Resampling.bilinear, num_threads=2,
-                )
-            return win, dest
-
     t0 = time.time()
-    # north-to-south, then west-to-east: completions still arrive out of order,
-    # but the writes stay loosely raster-scan, which keeps the block cache
-    # working on a moving band of the image rather than all of it
-    ordered = sorted(feats, key=lambda f: (-f["bbox"][3], f["bbox"][0]))
-    # Resume mode: reopen the existing mosaic and only fetch quads that left a
-    # hole. These runs take over an hour, so losing all of it to a handful of
-    # transient read failures — or to the machine sleeping — is not acceptable.
-    if fill_gaps:
-        tmp = dst
-        log(f"fill-gaps: reopening {dst.name}, skipping quads already filled")
-    with rasterio.open(tmp, "r+" if fill_gaps else "w+",
-                       **({} if fill_gaps else profile)) as out:
-        if fill_gaps:
-            todo = []
-            for f in ordered:
-                qw, qs, qe, qn = f["bbox"][0], f["bbox"][1], f["bbox"][2], f["bbox"][3]
-                bw, bs, be, bn = transform_bounds("EPSG:4326", crs, qw, qs, qe, qn,
-                                                  densify_pts=21)
-                c0 = max(0, int((bw - west) / res)); r0 = max(0, int((north - bn) / res))
-                c1 = min(width, int((be - west) / res) + 1)
-                r1 = min(height, int((north - bs) / res) + 1)
-                if c1 <= c0 or r1 <= r0:
-                    continue
-                w0 = Window(c0, r0, c1 - c0, r1 - r0)
-                # Fill *fraction*, not "has any data". NAIP quads overlap, so a
-                # quad that failed outright still has most of its window
-                # painted by its neighbours — `.any()` called every one of the
-                # 187 already-done and found nothing to fix.
-                band = out.read(1, window=w0)
-                if band.size and (band > 0).mean() >= 0.99:
-                    continue
-                todo.append(f)
-            log(f"fill-gaps: {len(todo)} of {len(ordered)} quads still empty")
-            ordered = todo
-        with cf.ThreadPoolExecutor(WORKERS) as ex:
-            futures = {ex.submit(fetch, f): f for f in ordered}
-            for fut in cf.as_completed(futures):
-                f = futures[fut]
-                try:
-                    win, dest = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    failed.append(f"{f['id']}: {type(e).__name__}: {e}")
-                    if len(failed) <= 5:
-                        log(f"  quad {f['id']} failed: {type(e).__name__}: {e}")
-                    continue
-                if win is not None:
-                    prev = out.read(window=win)
-                    fill = (prev.sum(axis=0) == 0) & (dest.sum(axis=0) > 0)
-                    prev[:, fill] = dest[:, fill]
-                    out.write(prev, window=win)
-                done += 1
-                if done % 10 == 0 or done == len(feats):
-                    el = time.time() - t0
-                    eta = el / max(done, 1) * (len(feats) - done)
-                    log(f"  {done}/{len(feats)} quads, {len(failed)} failed, "
-                        f"{el / 60:.1f} min elapsed, ~{eta / 60:.1f} min left")
+    # The file is closed after every strip, and only then is the strip
+    # recorded as done. GDAL holds written blocks in its cache and writes the
+    # tile index (where each block sits) only on close, so a build stopped
+    # with the file open lost every strip since it was opened: the first
+    # complete-looking 0.6 m build had its northern two-thirds empty, after
+    # two stops and resumes, and reported success. Reopening costs nothing
+    # next to a strip, and keeps the JPEG settings (its tables live in the
+    # file).
+    if first == 0:
+        with rasterio.open(part, "w", **profile):
+            pass
+    with rasterio.Env(GDAL_CACHEMAX=2048, GDAL_NUM_THREADS="ALL_CPUS",
+                      GDAL_HTTP_MULTIRANGE="YES", GDAL_HTTP_MERGE_CONSECUTIVE_RANGES="YES",
+                      GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", VSI_CACHE="FALSE"), \
+            cf.ThreadPoolExecutor(NAIP_FETCH_WORKERS) as ex:
 
-    # A per-quad except is right for one bad quad and dangerous for a
-    # systematic fault: opening the output "w" instead of "w+" made every
-    # single read fail, and without this check that produced a blank mosaic and
-    # a cheerful exit code.
-    if done == 0 and not fill_gaps:
-        raise RuntimeError(
-            f"every one of {len(feats)} NAIP quads failed; first errors:\n  "
-            + "\n  ".join(failed[:5]))
-    if failed and len(failed) > len(feats) * 0.1:
-        log(f"WARNING: {len(failed)}/{len(feats)} quads failed — mosaic has holes")
-    if not fill_gaps:
-        tmp.replace(dst)
-    log(f"NAIP mosaic complete: {done}/{len(feats)} quads, {len(failed)} failed")
+        def submit(i):
+            r0, r1, cols, quads = strip_plan(i)
+            futs = [] if cols is None else [
+                (f, ex.submit(fetch, f, r0, r1, a, b))
+                for f in quads for a, b in chunks(f, cols[0], cols[1])]
+            return r0, r1, cols, futs
+
+        expected = {}                                   # strip -> fill written
+        pending = submit(first) if first < n_strips else None
+        for i in range(first, n_strips):
+            r0, r1, cols, futs = pending
+            pending = submit(i + 1) if i + 1 < n_strips else None   # prefetch
+            strip = np.zeros((3, r1 - r0, width), dtype=np.uint8)
+            filled = np.zeros((r1 - r0, width), dtype=bool)
+            for f, fut in futs:                      # rank order: first wins
+                got = fut.result()
+                if got is None:
+                    continue
+                qc0, arr = got
+                has = arr.any(axis=0)
+                tgt = filled[:, qc0:qc0 + arr.shape[2]]
+                take = has & ~tgt
+                view = strip[:, :, qc0:qc0 + arr.shape[2]]
+                view[:, take] = arr[:, take]
+                tgt |= take
+            # 0 means "no data": lift real black pixels to 1 so they stay data
+            strip[:, filled] = np.maximum(strip[:, filled], 1)
+            with rasterio.open(part, "r+") as out:
+                out.write(strip, window=Window(0, r0, width, r1 - r0))
+            prog_path.write_text(json.dumps({"settings": settings, "strips_done": i + 1,
+                                             "flushed": True}), encoding="utf-8")
+            expected[i] = float(filled.mean())
+            el = time.time() - t0
+            eta = el / (i + 1 - first) * (n_strips - i - 1)
+            log(f"  strip {i + 1}/{n_strips}: {len({f['id'] for f, _ in futs})} quads, "
+                f"{filled.mean():.0%} filled, {el / 60:.1f} min elapsed, ~{eta / 60:.0f} min left")
+
+    # Every strip must read back the way it was written. A strip that comes
+    # back empty means the file lost it, and that must fail the build rather
+    # than ship a mosaic with holes (which is what the first one did).
+    missing = [i + 1 for i in range(n_strips)
+               if expected.get(i, 1.0) > 0.01
+               and not _strip_has_data(part, i * STRIP_ROWS, min(height, (i + 1) * STRIP_ROWS))]
+    if missing:
+        raise RuntimeError(f"NAIP: strips {missing} read back empty; the mosaic is incomplete")
+    log("NAIP: building JPEG overviews")
+    with rasterio.Env(COMPRESS_OVERVIEW="JPEG", PHOTOMETRIC_OVERVIEW="YCBCR",
+                      JPEG_QUALITY_OVERVIEW=str(quality), INTERLEAVE_OVERVIEW="PIXEL",
+                      GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=4096, BIGTIFF_OVERVIEW="YES"):
+        with rasterio.open(part, "r+") as ds:
+            ds.build_overviews([2, 4, 8, 16, 32, 64, 128], Resampling.average)
+            ds.update_tags(ns="rio_overview", resampling="average")
+    part.replace(dst)
+    prog_path.unlink(missing_ok=True)
+    log(f"NAIP mosaic complete: {dst.name}, {dst.stat().st_size / 1e9:.1f} GB, "
+        f"{(time.time() - t0) / 60:.0f} min")
     return dst
+
+
+# Work tiles for a region's NAIP: each NAIP box is cut into near-square
+# pieces of about NAIP_TILE_DEG, each built as its own mosaic. A region is
+# ~70,000 km² and ~16 hours of streaming; as one file a failure late in the run
+# would cost hours and the file would pass 100 GB. A tile is ~500 km², about
+# seven minutes, and a rerun skips every tile already on disk.
+NAIP_TILE_DEG = 0.25
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def naip_work_tiles(region: dict) -> list[dict]:
+    """The region's NAIP work tiles, box by box, south to north and west to
+    east, leaving out any tile wholly inside a mosaic it reuses."""
+    reuse = region.get("naip_reuse", [])
+
+    def covered(t):
+        return any(r["west"] <= t[0] and r["south"] <= t[1]
+                   and t[2] <= r["east"] and t[3] <= r["north"] for r in reuse)
+
+    out = []
+    for b in region["naip_boxes"]:
+        w, s_, e, n = b["west"], b["south"], b["east"], b["north"]
+        nx = max(1, math.ceil((e - w) / NAIP_TILE_DEG - 1e-9))
+        ny = max(1, math.ceil((n - s_) / NAIP_TILE_DEG - 1e-9))
+        dx, dy = (e - w) / nx, (n - s_) / ny
+        for j in range(ny):
+            for i in range(nx):
+                t = (round(w + i * dx, 6), round(s_ + j * dy, 6),
+                     round(w + (i + 1) * dx, 6), round(s_ + (j + 1) * dy, 6))
+                if not covered(t):
+                    out.append({"box": b["name"], "id": f"{_slug(b['name'])}_{j:02d}_{i:02d}",
+                                "bbox": t})
+    return out
+
+
+def write_naip_vrt(slug: str, region: dict, res: float = NAIP_RES) -> Path:
+    """interim/<slug>/imagery_naip_5070.vrt: every built work tile, plus the
+    mosaics the region reuses, as one 3-band mosaic.
+
+    Every NAIP mosaic here is EPSG:5070 at 0.6 m with its corner snapped to a
+    multiple of 0.6 m, so they share one grid and the VRT only places them:
+    no resampling. GDAL serves a VRT's decimated reads from its sources'
+    overviews, so the tiler and the panorama read it as they read one file."""
+    from xml.sax.saxutils import escape
+    src_dir = DATA / "interim" / slug / "naip"
+    paths = [DATA / r["mosaic"] for r in region.get("naip_reuse", [])
+             if (DATA / r["mosaic"]).exists()]
+    paths += sorted(p for p in src_dir.glob("*.tif") if not p.name.endswith(".part.tif"))
+    if not paths:
+        raise RuntimeError(f"no NAIP mosaics for {slug}")
+    info = []
+    for p in paths:
+        with rasterio.open(p) as ds:
+            if ds.crs.to_epsg() != 5070 or abs(ds.res[0] - res) > 1e-9:
+                raise RuntimeError(f"{p.name}: {ds.crs} @ {ds.res}, expected EPSG:5070 @ {res}")
+            info.append((p, ds.bounds, ds.width, ds.height, ds.crs))
+    west = min(b.left for _, b, *_ in info)
+    north = max(b.top for _, b, *_ in info)
+    east = max(b.right for _, b, *_ in info)
+    south = min(b.bottom for _, b, *_ in info)
+    width, height = int(round((east - west) / res)), int(round((north - south) / res))
+    bands = []
+    for band, interp in ((1, "Red"), (2, "Green"), (3, "Blue")):
+        srcs = []
+        for p, b, w, h, _ in info:
+            xo, yo = int(round((b.left - west) / res)), int(round((north - b.top) / res))
+            srcs.append(
+                f'    <ComplexSource>\n'
+                f'      <SourceFilename relativeToVRT="0">{escape(str(p))}</SourceFilename>\n'
+                f'      <SourceBand>{band}</SourceBand>\n'
+                f'      <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>\n'
+                f'      <DstRect xOff="{xo}" yOff="{yo}" xSize="{w}" ySize="{h}"/>\n'
+                f'      <NODATA>0</NODATA>\n'
+                f'    </ComplexSource>\n')
+        bands.append(f'  <VRTRasterBand dataType="Byte" band="{band}">\n'
+                     f'    <NoDataValue>0</NoDataValue>\n'
+                     f'    <ColorInterp>{interp}</ColorInterp>\n' + "".join(srcs)
+                     + '  </VRTRasterBand>\n')
+    dst = DATA / "interim" / slug / "imagery_naip_5070.vrt"
+    dst.write_text(
+        f'<VRTDataset rasterXSize="{width}" rasterYSize="{height}">\n'
+        f'  <SRS>{escape(info[0][4].to_wkt())}</SRS>\n'
+        f'  <GeoTransform>{west:.4f}, {res}, 0, {north:.4f}, 0, {-res}</GeoTransform>\n'
+        + "".join(bands)
+        # virtual overviews: GDAL answers them from the sources' own pyramids,
+        # and they let readers that check for overviews (the panorama's
+        # texture picker) use the VRT at coarse scales
+        + '  <OverviewList resampling="average">2 4 8 16 32 64 128</OverviewList>\n'
+        + '</VRTDataset>\n', encoding="utf-8")
+    log(f"NAIP VRT {dst.name}: {len(paths)} mosaics, {width}x{height} @{res:g}m")
+    return dst
+
+
+def build_naip_region(slug: str, region: dict, res: float = NAIP_RES,
+                      quality: int = NAIP_JPEG_QUALITY) -> list[Path]:
+    """Build every NAIP work tile of a region into interim/<slug>/naip/.
+
+    A tile already built is skipped, and one with no NAIP at all (open water,
+    Canada) leaves an .empty marker so it is not searched again. A tile that
+    fails is logged and the run moves on; rerunning retries it."""
+    tiles = naip_work_tiles(region)
+    out_dir = DATA / "interim" / slug / "naip"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log(f"NAIP region {slug}: {len(tiles)} work tiles in "
+        f"{len(region['naip_boxes'])} boxes")
+    built, failed, t0 = [], [], time.time()
+    for k, t in enumerate(tiles, 1):
+        dst = out_dir / f"{t['id']}.tif"
+        empty = out_dir / f"{t['id']}.empty"
+        if dst.exists() or empty.exists():
+            if dst.exists():
+                built.append(dst)
+            continue
+        log(f"NAIP work tile {k}/{len(tiles)}: {t['id']} ({t['box']}) {t['bbox']}, "
+            f"{(time.time() - t0) / 3600:.1f} h elapsed")
+        try:
+            feats = search_naip(t["bbox"])
+            if not feats:
+                empty.write_text("no NAIP quads", encoding="utf-8")
+                continue
+            built.append(build_naip_mosaic(feats, t["bbox"], dst, res=res, quality=quality))
+        except Exception as e:  # noqa: BLE001 — one tile must not stop the run
+            failed.append(t["id"])
+            log(f"NAIP work tile {t['id']} FAILED: {type(e).__name__}: {str(e)[:300]}")
+    log(f"NAIP region {slug}: {len(built)} tiles on disk, {len(failed)} failed"
+        + (f" ({', '.join(failed)}); rerun to retry" if failed else "")
+        + f", {(time.time() - t0) / 3600:.1f} h")
+    if built:
+        write_naip_vrt(slug, region, res)
+    return built
 
 
 # --------------------------------------------------------------------------
@@ -489,22 +989,47 @@ def build_naip_mosaic(feats: list, bbox, dst: Path, res: float = NAIP_RES,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--slug", default="alpine-lakes")
-    ap.add_argument("--source", choices=["s2", "naip", "both"], default="both")
+    ap.add_argument("--source", choices=["s2", "naip", "both", "naip-region", "s2-composite"],
+                    default="both")
+    ap.add_argument("--s2-near-km", type=float, default=30.0,
+                    help="s2-composite: 10 m out to this far past the core")
     ap.add_argument("--years", default="2023,2024")
     ap.add_argument("--naip-res", type=float, default=NAIP_RES)
-    ap.add_argument("--fill-gaps", action="store_true",
-                    help="reopen an existing NAIP mosaic and fetch only the "
-                         "quads that are still empty")
+    ap.add_argument("--naip-quality", type=int, default=NAIP_JPEG_QUALITY,
+                    help="JPEG quality of the NAIP mosaic")
     args = ap.parse_args()
 
-    aoi = json.loads((ROOT / "data" / "aoi" / f"{args.slug}.json").read_text("utf-8"))
+    aoi = json.loads((AOI_DIR / f"{args.slug}.json").read_text("utf-8"))
     buf = aoi["buffered"]
     core = aoi["core"]
     buf_bbox = (buf["west"], buf["south"], buf["east"], buf["north"])
     core_bbox = (core["west"], core["south"], core["east"], core["north"])
-    interim = ROOT / "data" / "interim" / args.slug
-    raw = ROOT / "data" / "raw" / args.slug
+    interim = DATA / "interim" / args.slug
+    raw = DATA / "raw" / args.slug
     raw.mkdir(parents=True, exist_ok=True)
+
+    if args.source == "s2-composite":
+        year = int(args.years.split(",")[0])
+        # 10 m over the core and a margin; 60 m over the far field, which only
+        # the panorama's distant levels see (they need ~150 m/texel)
+        dlat = args.s2_near_km / 111.0
+        dlon = dlat / math.cos(math.radians((core["south"] + core["north"]) / 2))
+        near = (core["west"] - dlon, core["south"] - dlat,
+                core["east"] + dlon, core["north"] + dlat)
+        build_s2_composite(near, interim / "imagery_s2_5070.tif", S2_RES, year)
+        build_s2_composite(buf_bbox, interim / "imagery_s2far_5070.tif", 60.0, year)
+        (raw / "s2_source.json").write_text(json.dumps({
+            "method": f"per-pixel median of clear looks (SCL), {year} {SEASON[0]}..{SEASON[1]}",
+            "collection": "sentinel-2-l2a", "asset": "visual", "endpoint": EARTH_SEARCH,
+            "near": {"bbox": near, "res_m": S2_RES}, "far": {"bbox": buf_bbox, "res_m": 60.0},
+            "licence": "Copernicus Sentinel data - free and open",
+            "attribution": f"Contains modified Copernicus Sentinel data {year}",
+        }, indent=2), encoding="utf-8")
+        return 0
+
+    if args.source == "naip-region":
+        build_naip_region(args.slug, aoi, res=args.naip_res, quality=args.naip_quality)
+        return 0
 
     if args.source in ("s2", "both"):
         years = [int(y) for y in args.years.split(",")]
@@ -523,10 +1048,11 @@ def main() -> int:
     if args.source in ("naip", "both"):
         feats = search_naip(core_bbox)
         build_naip_mosaic(feats, core_bbox, interim / "imagery_naip_5070.tif",
-                          res=args.naip_res, fill_gaps=args.fill_gaps)
+                          res=args.naip_res, quality=args.naip_quality)
         (raw / "naip_source.json").write_text(json.dumps({
             "collection": "naip", "endpoint": PC_SEARCH,
             "resolution_m": args.naip_res, "native_resolution_m": 0.6,
+            "jpeg_quality": args.naip_quality,
             "quads": len(feats),
             "licence": "Public domain (USDA NAIP, US Government work)",
             "attribution": "USDA National Agriculture Imagery Program",

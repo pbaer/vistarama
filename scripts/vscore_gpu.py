@@ -140,7 +140,7 @@ void march(const float* __restrict__ dem, const unsigned char* __restrict__ bad,
            const float curv, const int n_reach, const float canopy_h,
            const float canopy_mfp,
            const float loom_gain, const float loom_full, const float lift,
-           double* __restrict__ out)
+           double* __restrict__ out, float* __restrict__ hz_out)
 {
     const int ray = blockIdx.x * blockDim.x + threadIdx.x;
     if (ray >= n_rays) return;
@@ -212,6 +212,7 @@ void march(const float* __restrict__ dem, const unsigned char* __restrict__ bad,
         }
     }
     out[ray] = v;
+    hz_out[ray] = run;                 // the skyline's elevation angle, radians
 }
 """
 
@@ -306,8 +307,28 @@ class GpuScorer:
 
     def score(self, points: list[tuple[float, float]], progress=None) -> list[float | None]:
         """V for each (lat, lon); None where the point is off the DEM."""
-        cp = self.cp
         out: list[float | None] = [None] * len(points)
+        for idx, res, _hz in self._batches(points, progress):
+            per_point = res.reshape(len(idx), self.n_az).sum(axis=1).get()
+            for i, v in zip(idx, per_point):
+                out[i] = float(v)
+        return out
+
+    def score_rays(self, points: list[tuple[float, float]]) -> list:
+        """Per ray, for each point: (V of each of the N_AZ rays, the skyline's
+        elevation angle along each in degrees), or None off the DEM."""
+        out: list = [None] * len(points)
+        for idx, res, hz in self._batches(points, None):
+            v = res.reshape(len(idx), self.n_az).get()
+            h = np.degrees(hz.reshape(len(idx), self.n_az).get())
+            for k, i in enumerate(idx):
+                out[i] = (v[k], h[k])
+        return out
+
+    def _batches(self, points, progress):
+        """Run the march in batches: yields (point indices, per-ray V,
+        per-ray skyline angle), the arrays still on the GPU."""
+        cp = self.cp
         nk = self.knots.size
         lats_all = np.array([p[0] for p in points], np.float64)
         lons_all = np.array([p[1] for p in points], np.float64)
@@ -315,12 +336,12 @@ class GpuScorer:
         for b0 in range(0, len(points), BATCH):
             idx = [i for i in range(b0, min(b0 + BATCH, len(points)))
                    if np.isfinite(ez_all[i])]
-            ok = list(range(len(idx)))
             if idx:
                 kc, kr = self.gpu_knots(lats_all[idx], lons_all[idx])
                 ez = ez_all[idx].astype(np.float32)
-                n_rays = len(ok) * self.n_az
+                n_rays = len(idx) * self.n_az
                 res = cp.zeros(n_rays, dtype=cp.float64)
+                hz = cp.zeros(n_rays, dtype=cp.float32)
                 threads = 128
                 self.kernel(
                     ((n_rays + threads - 1) // threads,), (threads,),
@@ -340,20 +361,17 @@ class GpuScorer:
                      np.float32(vscore.LOOM_GAIN),
                      np.float32(math.radians(vscore.LOOM_FULL_DEG)),
                      np.float32(vscore.TERRAIN_LIFT_M),
-                     res))
-                per_point = res.reshape(len(ok), self.n_az).sum(axis=1).get()
-                for j, v in zip(ok, per_point):
-                    out[idx[j]] = float(v)
+                     res, hz))
+                yield idx, res, hz
             if progress:
                 progress(min(len(points), b0 + BATCH), len(points))
-        return out
 
 
 def validate(dem: Path, lc: Path, n: int = 24, seed: int = 3) -> dict:
     """Compare against the CPU march at random points in the core AOI."""
     import json
-    aoi = json.loads((Path(__file__).resolve().parents[1] / "data" / "aoi"
-                      / "alpine-lakes.json").read_text("utf-8"))["core"]
+    from aoi import AOI_DIR
+    aoi = json.loads((AOI_DIR / "alpine-lakes.json").read_text("utf-8"))["core"]
     rng = np.random.default_rng(seed)
     pts = [(float(rng.uniform(aoi["south"], aoi["north"])),
             float(rng.uniform(aoi["west"], aoi["east"]))) for _ in range(n)]

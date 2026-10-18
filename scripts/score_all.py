@@ -52,7 +52,7 @@ def main() -> int:
     if "--limit" in sys.argv:
         limit = int(sys.argv[sys.argv.index("--limit") + 1])
 
-    status_path = fs.ROOT / "data" / "derived" / slug / "score_all.json"
+    status_path = fs.DATA / "derived" / slug / "score_all.json"
     t0 = time.time()
     status = {"state": "planning", "started": t0, "version": fs.version()}
     write_status(status_path, status)

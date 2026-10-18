@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # Data. Everything under data/ is derived from public sources by the scripts in
-# this repo, and it is far too big for git: the Alpine Lakes AOI alone is ~11 GB
-# (a 7.7 GB NAIP mosaic, a 0.5 GB Sentinel-2 mosaic, ~60k raster tiles).
+# this repo, and it is far too big for git: the Alpine Lakes AOI alone is ~15 GB
+# (a 7.7 GB NAIP mosaic, a 0.9 GB Sentinel-2 mosaic, ~200k raster tiles).
 #
 # Rebuild it with:
 #   python scripts/download.py alpine-lakes
@@ -16,6 +16,10 @@ data/*
 !data/aoi/
 !data/README.md
 data/imagery.log
+
+# Where this machine keeps the data, if not in data/ (see scripts/aoi.py):
+#   {"data_root": "C:/data/vistarama"}
+vistarama.local.json
 
 # Python
 __pycache__/

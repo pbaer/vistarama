@@ -2,11 +2,33 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
-AOI_DIR = DATA / "aoi"
+
+# The AOI definitions are tracked inputs and stay in the repo. Everything
+# built from them lives under the data root, which can be anywhere: it is
+# ~15 GB for one AOI and read hard by the tiler and the panorama, so it
+# belongs on the fastest disk with room. VISTARAMA_DATA wins, then
+# "data_root" in the untracked vistarama.local.json at the repo root, then
+# <repo>/data.
+LOCAL_CONFIG = ROOT / "vistarama.local.json"
+
+
+def _data_root() -> Path:
+    env = os.environ.get("VISTARAMA_DATA")
+    if env:
+        return Path(env)
+    if LOCAL_CONFIG.exists():
+        root = json.loads(LOCAL_CONFIG.read_text(encoding="utf-8")).get("data_root")
+        if root:
+            return Path(root)
+    return ROOT / "data"
+
+
+DATA = _data_root()
+AOI_DIR = ROOT / "data" / "aoi"
 RAW = DATA / "raw"
 INTERIM = DATA / "interim"
 DERIVED = DATA / "derived"

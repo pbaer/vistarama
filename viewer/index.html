@@ -26,6 +26,21 @@
       <div id="vector-list" class="layer-list"></div>
     </section>
 
+    <section id="vf">
+      <h2>Filter by view score</h2>
+      <div class="vf-row">
+        <div id="vf-mode" class="pano-seg" role="group" aria-label="Filter on">
+          <button data-mode="avg" class="on" title="A trail's or lake's average V; a peak's, pass's or camp's V">Average</button>
+          <button data-mode="best" title="The highest V anywhere along a trail or shoreline; a peak's, pass's or camp's V">Best</button>
+        </div>
+        <span id="vf-val">off</span>
+      </div>
+      <input id="vf-slider" type="range" min="0" max="1000" value="0"
+             aria-label="Minimum view score">
+      <p id="vf-count" class="vf-note">Trails, peaks, passes, lakes and camps below
+        the threshold are hidden on the map and in the ranked list.</p>
+    </section>
+
     <section>
       <h2>Extents</h2>
       <div id="extent-list" class="layer-list"></div>
@@ -33,9 +48,10 @@
 
     <section>
       <h2>View from here</h2>
-      <p class="tool-hint">Click the map to render the 360° panorama from 2 m
-        above that point, with curvature and haze. Alt-click a feature to see
-        its tags.</p>
+      <p class="tool-hint">Press <kbd>v</kbd> over the map, or click a trail,
+        peak, pass, lake, camp or viewpoint, to render the 360° panorama from
+        2 m above that point, with curvature and haze. Alt-click a feature to
+        see its tags.</p>
     </section>
 
     <section id="legend-section" hidden>
@@ -61,12 +77,23 @@
       <button id="rank-close" class="vs-toggle" title="Hide the list">✕</button>
     </header>
     <div id="rank-progress" hidden></div>
+    <div class="rank-place">
+      <div id="rank-place" class="pano-seg" role="group" aria-label="Where">
+        <button data-place="view" class="on" title="Items whose best point is in the map's visible area">Visible area</button>
+        <button data-place="box" title="Items whose best point is in a box you drag out on the map">Box</button>
+      </div>
+      <button id="rank-box-draw" class="rank-boxbtn" hidden title="Drag out a new box on the map">Redraw</button>
+      <button id="rank-box-clear" class="rank-boxbtn" hidden title="Remove the box and follow the visible area">Clear</button>
+      <input id="rank-q" type="search" placeholder="Search by name" autocomplete="off"
+             spellcheck="false" aria-label="Search by name">
+    </div>
     <div class="rank-filters">
       <div id="rank-type" class="pano-seg" role="group" aria-label="Show">
         <button data-type="trails" class="on">Trails</button>
         <button data-type="peaks">Peaks</button>
         <button data-type="passes">Passes</button>
         <button data-type="water_areas">Lakes</button>
+        <button data-type="camps">Camps</button>
         <button data-type="all">All</button>
       </div>
       <label class="rank-named"><input type="checkbox" id="rank-named" checked> named only</label>
@@ -88,19 +115,8 @@
   </aside>
   <button id="rank-toggle" hidden title="Show the ranked list">Ranked list</button>
 
-  <aside id="vscore" hidden aria-label="View score">
-    <header>
-      <h2>View score <span id="vs-where"></span></h2>
-      <button id="vs-toggle" class="vs-toggle" aria-expanded="true" title="Collapse">▾</button>
-    </header>
-    <div id="vs-hero">
-      <span id="vs-value">—</span><span class="vs-unit">sr·km</span>
-      <span id="vs-state"></span>
-    </div>
-    <div id="vs-alt" hidden></div>
-    <div class="vs-formula">V = Σ ΔΩ · c(class) · w(d) · T · u(φ) · d<sup>γ</sup></div>
-    <div id="vs-body"></div>
-  </aside>
+
+  <div id="map-hint">Press <kbd>v</kbd> to move viewpoint to cursor</div>
 
   <div id="status">
     <span id="pos">—</span>
@@ -145,6 +161,19 @@
       <div id="pano-hover" hidden></div>
       <div id="pano-compass"></div>
       <div id="pano-offset" hidden></div>
+      <aside id="vscore" class="collapsed" hidden aria-label="View score">
+        <header>
+          <h2>View score <span id="vs-where"></span></h2>
+          <button id="vs-toggle" class="vs-toggle" aria-expanded="false" title="Expand">▾</button>
+        </header>
+        <div id="vs-hero">
+          <span id="vs-value">—</span><span class="vs-unit">sr·km</span>
+          <span id="vs-state"></span>
+        </div>
+        <div id="vs-alt" hidden></div>
+        <div class="vs-formula">V = Σ ΔΩ · c(class) · w(d) · T · u(φ) · d<sup>γ</sup></div>
+        <div id="vs-body"></div>
+      </aside>
       <div id="pano-hint">drag to look around · scroll to zoom · arrows / WASD to move</div>
       <div id="pano-loading" hidden>
         <div class="spin"></div>
@@ -152,7 +181,7 @@
         <div id="pano-loading-sub"></div>
       </div>
     </div>
-    <div id="pano-status">click a point on the map</div>
+    <div id="pano-status">press v over the map</div>
   </section>
 
   <script src="vendor/leaflet.js"></script>

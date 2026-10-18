@@ -5,7 +5,14 @@ irreplaceable, and only because re-downloading is slow — nothing in it is
 edited, ever.
 
 Nothing here except `aoi/` and this file is in git (see `.gitignore`). The
-Alpine Lakes AOI is ~11 GB, most of it the NAIP mosaic.
+Alpine Lakes AOI is ~15 GB, half of it the NAIP mosaic.
+
+**Where it lives.** `aoi/` and this file stay in the repo. Everything else is
+under the *data root*: `VISTARAMA_DATA` if set, else `data_root` in the
+untracked `vistarama.local.json` at the repo root, else this folder (see
+`scripts/aoi.py`). The paths below are relative to it. On the main machine
+it is `C:/data/vistarama`, a PCIe 4.0 NVMe, which reads twice as fast as the
+repo's drive.
 
 ```
 data/
@@ -29,9 +36,10 @@ data/
 ```
 
 The NAIP mosaic is the one exception to "raw first": `scripts/imagery.py`
-reads each quad from Planetary Computer through its COG overviews and writes
-straight into `interim/<aoi>/imagery_naip_5070.tif` at 2 m. Keeping the
-0.6 m quads would have meant tens of GB in `raw/` for no use.
+streams each quad from Planetary Computer and writes straight into
+`interim/<aoi>/imagery_naip_5070.tif` at its native 0.6 m, JPEG-compressed
+(7.7 GB for the core). Keeping the quads themselves would have meant ~50 GB
+in `raw/` for no use.
 
 ## Rules
 
@@ -76,7 +84,7 @@ For European AOIs the metric CRS becomes EPSG:3035 (ETRS89-LAEA).
 | Relief | 120 m grid | elevation σ over a 10 km biweight kernel, permanent water excluded |
 | Openness (+, −, defect) | 60 m grid | Yokoyama openness, 8 azimuths out to 1.2 km |
 | Sentinel-2 imagery | 10 m | native |
-| NAIP imagery | 2 m | native is 0.6 m; see the main README's "What's not done" |
+| NAIP imagery | 0.6 m | native; JPEG/YCbCr q88, core AOI only |
 
 Higher-resolution DEMs exist for Washington (WA DNR lidar) and are deliberately
 not used for scoring — see the manifest doc for why.

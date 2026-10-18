@@ -31,6 +31,16 @@ DEP3_URL = (
     "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/"
     "current/{tile}/USGS_1_{tile}.tif"
 )
+# Copernicus GLO-30, for 1° tiles 3DEP does not cover (Canada). Named by the
+# SW corner, where 3DEP names the NW one: 3DEP n50w123 is GLO-30 N49 W123.
+GLO30_URL = (
+    "https://copernicus-dem-30m.s3.amazonaws.com/"
+    "Copernicus_DSM_COG_10_{ns}{lat:02d}_00_{ew}{lon:03d}_00_DEM/"
+    "Copernicus_DSM_COG_10_{ns}{lat:02d}_00_{ew}{lon:03d}_00_DEM.tif"
+)
+# 3DEP's tiles north of the border carry only a strip of Canada, if any; north
+# of this the DEM comes from GLO-30 alone so one source covers each country.
+DEP3_MAX_NORTH = 49
 WORLDCOVER_URL = (
     "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/"
     "ESA_WorldCover_10m_2021_v200_{tile}_Map.tif"
@@ -319,8 +329,17 @@ def download_osm(slug: str, bb: tuple[float, float, float, float],
 
 # --------------------------------------------------------------------------
 
+def glo30_dest(tile: str) -> tuple[str, Path]:
+    """GLO-30 URL and local path for the 1° cell a 3DEP tile name covers."""
+    north, west = int(tile[1:3]), int(tile[4:7])
+    south = north - 1
+    url = GLO30_URL.format(ns="N", lat=south, ew="W", lon=west)
+    return url, RAW / "glo30" / f"Copernicus_DSM_COG_10_N{south:02d}_00_W{west:03d}_00_DEM.tif"
+
+
 def main() -> int:
-    slug = sys.argv[1] if len(sys.argv) > 1 else "alpine-lakes"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    slug = args[0] if args else "alpine-lakes"
     aoi = load_aoi(slug)
     ensure_dirs(slug)
     bb = bbox(aoi, aoi.get("vector_extent", "buffered"))
@@ -329,9 +348,15 @@ def main() -> int:
     log("=== 3DEP 1 arc-second DEM ===")
     for tile in aoi["sources"]["dem"]["tiles"]:
         dest = RAW / "3dep-1as" / f"USGS_1_{tile}.tif"
-        if not fetch(DEP3_URL.format(tile=tile), dest, min_bytes=1 << 20):
-            log(f"WARNING: DEM tile {tile} unavailable")
-            ok = False
+        if int(tile[1:3]) <= DEP3_MAX_NORTH and fetch(
+                DEP3_URL.format(tile=tile), dest, min_bytes=1 << 20):
+            continue
+        # no 3DEP tile here (Canada, or open sea): GLO-30, if it has one
+        url, gdest = glo30_dest(tile)
+        gdest.parent.mkdir(parents=True, exist_ok=True)
+        if fetch(url, gdest, min_bytes=1 << 16):
+            continue
+        log(f"no DEM tile for {tile} (open sea, or outside both datasets)")
 
     log("=== ESA WorldCover 10 m ===")
     for tile in aoi["sources"]["landcover"]["tiles"]:
@@ -354,8 +379,11 @@ def main() -> int:
         log("RGI unavailable (likely needs Earthdata login) "
             "— OSM natural=glacier will be used instead")
 
-    log("=== OpenStreetMap (Overpass) ===")
-    download_osm(slug, bb, aoi)
+    if "--no-osm" in sys.argv:
+        log("skipping OSM (--no-osm)")
+    else:
+        log("=== OpenStreetMap (Overpass) ===")
+        download_osm(slug, bb, aoi)
 
     log("done" if ok else "done, with warnings")
     return 0

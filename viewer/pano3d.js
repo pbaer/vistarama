@@ -81,6 +81,11 @@
     return p;
   }
 
+  // Focus patches (see updateFocus). Twelve: with the four ladder levels that
+  // is the sixteen texture units a WebGL 1 fragment shader can have.
+  const FOCUS_N = 12;
+  const focusLines = (f) => Array.from({ length: FOCUS_N }, (_, i) => f(i));
+
   // ---- shaders -------------------------------------------------------------
   const TERRAIN_VS = `
     attribute vec3 aPos;
@@ -123,12 +128,12 @@
     uniform float uHaze;
     uniform vec3 uHazeColor;
     uniform sampler2D uTex0, uTex1, uTex2, uTex3;
-    uniform sampler2D uTexF0, uTexF1, uTexF2, uTexF3;
+    uniform sampler2D ${focusLines((i) => `uTexF${i}`).join(', ')};
     uniform vec4 uHalf;          // half-extent in metres of each level
+    uniform vec4 uTexel;         // texel size in metres of each level
     uniform float uTexMix;       // 0 = vertex colour, 1 = imagery
     // focus patches, coarsest first: centre x, y, half, texel (0 = unused)
-    uniform vec4 uFocus0, uFocus1, uFocus2, uFocus3;
-    uniform float uPix;          // radians per device pixel
+    uniform vec4 ${focusLines((i) => `uFocus${i}`).join(', ')};
 
     vec3 sampleLevel(sampler2D t, float half_m) {
       vec2 uv = vWorld / (2.0 * half_m) + 0.5;
@@ -150,14 +155,20 @@
       return 1.0 - smoothstep(half_m * 0.72, half_m * 0.97, r);
     }
 
-    // A focus patch over whatever is beneath it (see Pano3D.updateFocus).
-    // It has no mipmaps, so it also fades out wherever it would be minified,
-    // which leaves those fragments to the mipmapped ladder.
-    vec3 focus(vec3 img, sampler2D t, vec4 f) {
+    // A focus patch over whatever is beneath it (see Pano3D.updateFocus),
+    // faded out at its edges, and wherever it is no finer than the ladder
+    // beneath ("ladder": the texel of the levels blended at this fragment).
+    // Patches are mipmapped and anisotropically filtered like the ladder, so
+    // a patch stays correct wherever it is minified and keeps serving the
+    // ground beyond the distance it was cut for. But a patch planned for the
+    // far field is coarse and huge (56 m texels over 114 km), and drawn
+    // everywhere inside its square it painted those texels over the 2.4 m
+    // ladder in the foreground: every view with one looked smeared.
+    vec3 focus(vec3 img, sampler2D t, vec4 f, float ladder) {
       if (f.w <= 0.0) return img;
       vec2 d = (vWorld - f.xy) / f.z;
       float w = 1.0 - smoothstep(0.88, 0.99, max(abs(d.x), abs(d.y)));
-      w *= 1.0 - smoothstep(1.3, 2.0, vDist * uPix / f.w);
+      w *= 1.0 - smoothstep(0.8, 1.0, f.w / ladder);
       vec2 uv = vec2(d.x, -d.y) * 0.5 + 0.5;
       return mix(img, texture2D(t, clamp(uv, 0.0005, 0.9995)).rgb, w);
     }
@@ -168,15 +179,15 @@
         float r = length(vWorld);
         // coarsest first, each finer level blended over it. The outermost
         // spans the whole mesh, so there is always something to fall back to.
+        float w2 = wt(uHalf.z, r), w1 = wt(uHalf.y, r), w0 = wt(uHalf.x, r);
         vec3 img = sampleLevel(uTex3, uHalf.w);
-        img = mix(img, sampleLevel(uTex2, uHalf.z), wt(uHalf.z, r));
-        img = mix(img, sampleLevel(uTex1, uHalf.y), wt(uHalf.y, r));
-        img = mix(img, sampleLevel(uTex0, uHalf.x), wt(uHalf.x, r));
+        img = mix(img, sampleLevel(uTex2, uHalf.z), w2);
+        img = mix(img, sampleLevel(uTex1, uHalf.y), w1);
+        img = mix(img, sampleLevel(uTex0, uHalf.x), w0);
+        // the texel those weights blend to: what a patch has to beat here
+        float ladder = mix(mix(mix(uTexel.w, uTexel.z, w2), uTexel.y, w1), uTexel.x, w0);
         // focus patches last, so the finest one wins where they overlap
-        img = focus(img, uTexF0, uFocus0);
-        img = focus(img, uTexF1, uFocus1);
-        img = focus(img, uTexF2, uFocus2);
-        img = focus(img, uTexF3, uFocus3);
+        ${focusLines((i) => `img = focus(img, uTexF${i}, uFocus${i}, ladder);`).join('\n        ')}
         base = mix(vColor, img, uTexMix);
       }
       // exponential extinction toward the haze colour — atmospheric perspective
@@ -299,8 +310,8 @@
     this.texReady = false;
     this._texToken = 0;                  // discards textures from a stale point
     this.texSizes = null;
-    // four ladder levels, then the four focus patches
-    this.tex = [0, 1, 2, 3, 4, 5, 6, 7].map(() => {
+    // four ladder levels, then the focus patches
+    this.tex = Array.from({ length: 4 + FOCUS_N }, () => {
       const t = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, t);
       // 1x1 grey placeholder so the sampler is always complete — an incomplete
@@ -315,6 +326,17 @@
     });
     this.focusSlots = this.tex.slice(4).map((tex) =>
       ({ tex, patch: null, pending: null, token: 0 }));
+    // Anisotropic filtering, as much as the GPU offers (16x on anything
+    // recent). Trilinear filtering picks its mip level from the longer axis of
+    // a pixel's footprint, and terrain seen obliquely, which is most of what a
+    // summit shows, is stretched along the line of sight many times over: the
+    // GPU fell back to a far blurrier level than the texture held. Measured
+    // from Stuart's summit at fov 55, 96% of pixels were softer than the
+    // imagery allowed; with 16x, 2%.
+    this.anisoExt = gl.getExtension('EXT_texture_filter_anisotropic')
+      || gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic');
+    this.anisoLevel = this.anisoExt
+      ? gl.getParameter(this.anisoExt.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : 1;
 
     this.yaw = 0;          // compass bearing the camera faces, degrees
     this.pitch = -4;       // degrees, positive = up
@@ -395,8 +417,8 @@
     // sharpening L0 does nothing for the seam at L0's own edge — L1 is what
     // has to carry it, and that first handover is the most visible: nearest,
     // largest on screen, and where NAIP-sharp foreground gives way. L0 at 2048
-    // is already 2.44 m/texel, which is what NAIP at 2 m actually carries;
-    // more there would only interpolate.
+    // is 2.44 m/texel; NAIP's finer 0.6 m reaches the screen through the focus
+    // patches below, which spend it only where the view needs it.
     //
     // VRAM is the ceiling. Four 4096 textures with mipmaps on top of a 1.7M
     // vertex mesh made the last upload come back corrupt: the far level read
@@ -409,11 +431,15 @@
     //
     // Zooming in used to scale this whole ladder up, but with every other
     // level already at its cap that only ever enlarged L0, interpolating the
-    // 2 m source to 1.2 m. Zoom detail now comes from the focus patch instead
-    // (updateFocus), which spends the same 64 MB where the camera is pointing.
+    // 2 m source to 1.2 m. Zoom detail now comes from the focus patches
+    // instead (updateFocus), which spend their texels where the camera is
+    // pointing.
     const sizes = [2048, 4096, 4096, 2048].map((s) => Math.min(s, max));
     this.texSizes = sizes;
     const token = ++this._texToken;
+    // which point these levels are cut for: a mesh for any other point must
+    // not draw with them (see texFor and load)
+    this._texFor = { lat, lon };
     // focus patches belong to the old viewpoint's frame
     for (const sl of this.focusSlots) {
       sl.token++; sl.patch = null; sl.pending = null;
@@ -421,6 +447,7 @@
 
     return Promise.all(this.texHalf.map((half, i) => new Promise((resolve) => {
       const img = new Image();
+      let tries = 0;
       img.onload = () => {
         if (token !== this._texToken) return resolve(false);   // superseded
         gl.bindTexture(gl.TEXTURE_2D, this.tex[i]);
@@ -431,14 +458,37 @@
         gl.generateMipmap(gl.TEXTURE_2D);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER,
           gl.LINEAR_MIPMAP_LINEAR);
+        if (this.anisoExt) {
+          gl.texParameterf(gl.TEXTURE_2D,
+            this.anisoExt.TEXTURE_MAX_ANISOTROPY_EXT, this.anisoLevel);
+        }
         this.texReady = true;
         this.render();
         resolve(true);
       };
-      img.onerror = () => resolve(false);
-      img.src = `/api/texture?lat=${lat}&lon=${lon}&slug=${slug}`
+      const url = `/api/texture?lat=${lat}&lon=${lon}&slug=${slug}`
         + `&half_m=${Math.round(half)}&size=${sizes[i]}`;
+      // A level that fails would leave the previous viewpoint's image in its
+      // texture unit, drawn over this mesh 2 km out of place. Retry it; if
+      // it still fails, drop the imagery (land-cover colours) rather than
+      // show a misplaced photograph.
+      img.onerror = () => {
+        if (token !== this._texToken) return resolve(false);
+        if (++tries <= 2) { setTimeout(() => { img.src = `${url}&retry=${tries}`; }, 500 * tries); return; }
+        console.warn('panorama texture failed', url);
+        this.texReady = false;
+        this._texFor = null;
+        this.render();
+        resolve(false);
+      };
+      img.src = url;
     })));
+  };
+
+  /** Whether the ladder textures were cut for this point (lat, lon). */
+  Pano3D.prototype.texFor = function (lat, lon) {
+    const t = this._texFor;
+    return !!t && Math.abs(t.lat - lat) < 1e-6 && Math.abs(t.lon - lon) < 1e-6;
   };
 
   // Focus patches: a few extra squares of imagery placed where the camera is
@@ -451,23 +501,33 @@
   // VRAM ceiling, because it spends its texels on every direction at once and
   // a zoomed view only sees a few degrees of them.
   //
-  // Four 2048 patches rather than one 4096: the same 64 MB, but a single
-  // patch has to pick one distance. Aiming it at the screen centre failed on
-  // the first real view tried, looking at Cashmere from 5 km at fov 8: the
-  // centre ray slipped past the summit and landed on a ridge 67 km away, so
-  // the patch went there and Cashmere stayed at 4.9 m/texel. Several smaller
-  // patches, placed by what they gain across the whole screen, can serve the
-  // near mountain and the far skyline at once.
-  const FOCUS_N = 4;
+  // Several 2048 patches rather than one large one: a single patch has to
+  // pick one distance. Aiming it at the screen centre failed on the first
+  // real view tried, looking at Cashmere from 5 km at fov 8: the centre ray
+  // slipped past the summit and landed on a ridge 67 km away, so the patch
+  // went there and Cashmere stayed at 4.9 m/texel. Patches placed by what
+  // they gain across the whole screen serve the near mountain and the far
+  // skyline at once.
+  //
+  // Twelve (FOCUS_N, the most the sixteen texture units allow), mipmapped and
+  // anisotropically filtered. Measured with textureAudit on a 2293x1175
+  // canvas over 48 views (two summits, a lakeshore, a valley; fov 55 to 8),
+  // against the sharpest imagery available at each pixel: with four
+  // unmipmapped patches and no anisotropic filtering, 26% of pixels were more
+  // than 1.25x softer than they could be; with anisotropic filtering, 18%;
+  // with twelve mipmapped patches, 3.8% (p90 1.10x). That audit assumed a
+  // patch was used only where it helped, while the shader drew it anywhere in
+  // its square: a coarse far-field patch then smeared the foreground. With
+  // patches faded wherever they are no finer than the ladder (see focus() in
+  // the shader) and the audit modelling that, 24 views at 1030x406 give 1.9%.
+  // Frame time stays ~3 ms; the patches add ~270 MB of texture and a few
+  // seconds of streaming after a view settles.
   const FOCUS_SIZE = 2048;
-  // The NAIP mosaic's own resolution. Finer than this the server can only
-  // interpolate, so a patch never asks for it.
-  const FOCUS_MIN_TEXEL_M = 2;
-  // The planner's screen sampling grid.
-  const FOCUS_GRID_X = 32, FOCUS_GRID_Y = 16;
-  // The shader fades a patch out where it would be minified by more than this
-  // (it has no mipmaps), so the planner counts those fragments as uncovered.
-  const FOCUS_MAX_MINIFY = 1.3;
+  // The NAIP mosaic's own resolution (0.6 m, NAIP's native). Finer than this
+  // the server can only interpolate, so a patch never asks for it.
+  const FOCUS_MIN_TEXEL_M = 0.6;
+  // The planner's screen sampling grid: fine enough to place twelve patches.
+  const FOCUS_GRID_X = 48, FOCUS_GRID_Y = 24;
   // Stop adding patches once the best one gains less than this, in mean
   // log-resolution per screen sample.
   const FOCUS_MIN_GAIN = 0.02;
@@ -506,9 +566,10 @@
     return s;
   };
 
+  // A patch serves every sample inside its unfaded square: mipmapped, it is
+  // right wherever it is minified, so only how fine it is decides its gain.
   function focusCovers(p, q) {
-    return Math.abs(q.x - p.x) <= p.half && Math.abs(q.y - p.y) <= p.half
-      && q.need <= p.texel * FOCUS_MAX_MINIFY;
+    return Math.abs(q.x - p.x) <= p.half * 0.88 && Math.abs(q.y - p.y) <= p.half * 0.88;
   }
 
   /** Summed gain in log-resolution over the samples patch p would improve. */
@@ -617,11 +678,15 @@
           gl.bindTexture(gl.TEXTURE_2D, sl.tex);
           gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
-          // No mipmaps: they would add a third to the patches' 64 MB, and
-          // that third is what tips the total over the VRAM ceiling described
-          // in loadTextures. The shader fades a patch out wherever it would
-          // be minified instead, so the ladder's mipmaps carry those fragments.
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          // Mipmapped and anisotropically filtered like the ladder, so the
+          // patch is right wherever it lands minified, obliquely or farther
+          // away than it was cut for. Twelve such patches are ~270 MB.
+          gl.generateMipmap(gl.TEXTURE_2D);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+          if (this.anisoExt) {
+            gl.texParameterf(gl.TEXTURE_2D,
+              this.anisoExt.TEXTURE_MAX_ANISOTROPY_EXT, this.anisoLevel);
+          }
           sl.patch = want;
           sl.pending = null;
           this.render();
@@ -638,8 +703,98 @@
     }));
   };
 
+  /** Texture audit: how sharp the imagery on screen is against how sharp it
+   *  could be. For a grid of screen points it emulates what the shader
+   *  samples there (the ladder level the radial fades settle on, the mip level
+   *  the GPU picks for the pixel's footprint, a focus patch if one covers the
+   *  point unminified) and compares that texel with the one the screen needs:
+   *  the pixel's footprint on the ground across the line of sight, but never
+   *  finer than the best source at that spot, `srcRes(x, y)` in metres (world
+   *  metres east/north of the mesh centre). A ratio of 1 means the imagery
+   *  is as sharp as anything we have could make it; 2 means visibly soft.
+   *
+   *  A measuring tool for tuning, not used in rendering. */
+  Pano3D.prototype.textureAudit = function (srcRes, gx = 96, gy = 54) {
+    if (!this.data || !this.texSizes) return null;
+    const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
+    const pix = this.pixAngle();
+    const eye = this.eye();
+    const sizes = this.texSizes;
+    const aniso = this.anisoLevel || 1;
+    const patches = this.focusSlots.map((sl) => sl.patch).filter(Boolean);
+    const wt = (half, r) => {
+      const e0 = half * 0.72, e1 = half * 0.97;
+      if (r <= e0) return 1; if (r >= e1) return 0;
+      const t = (r - e0) / (e1 - e0); return 1 - t * t * (3 - 2 * t);
+    };
+    const out = [];
+    for (let j = 0; j < gy; j++) {
+      for (let i = 0; i < gx; i++) {
+        const sx = (i + 0.5) * W / gx, sy = (j + 0.5) * H / gy;
+        const hit = this.pickGround(sx, sy);
+        if (!hit) continue;
+        const a = hit.az * Math.PI / 180;
+        const x = hit.dist * Math.sin(a), y = hit.dist * Math.cos(a);
+        const z = this.heightAtWorld(x, y);
+        if (z === null) continue;
+        const vx = x - eye[0], vy = y - eye[1], vz = z - eye[2];
+        const d3 = Math.hypot(vx, vy, vz);
+        // surface normal from the mesh, for how obliquely the pixel lands
+        const e = 5;
+        const zx = (this.heightAtWorld(x + e, y) ?? z) - (this.heightAtWorld(x - e, y) ?? z);
+        const zy = (this.heightAtWorld(x, y + e) ?? z) - (this.heightAtWorld(x, y - e) ?? z);
+        const nx = -zx / (2 * e), ny = -zy / (2 * e), nn = Math.hypot(nx, ny, 1);
+        const cosInc = Math.abs((vx * nx + vy * ny + vz) / (d3 * nn));
+        const minor = d3 * pix;                      // across the line of sight
+        const major = minor / Math.max(cosInc, 0.02); // along it, foreshortened
+        const need = Math.max(srcRes(x, y), minor);
+        // the ladder, finest level the fades still give at least half weight
+        const r = Math.hypot(x, y);
+        let lvl = 3;
+        for (let k = 2; k >= 0; k--) if (wt(this.texHalf[k], r) >= 0.5) lvl = k;
+        const tLevel = 2 * this.texHalf[lvl] / sizes[lvl];
+        // trilinear picks its mip by the larger footprint axis, anisotropic
+        // filtering by up to `aniso` times less
+        let got = Math.max(tLevel, minor, major / aniso);
+        let by = `L${lvl}`;
+        // A focus patch replaces the ladder inside its unfaded square, but
+        // only where it is finer than the ladder's blended texel there, as
+        // the shader does; the finest such patch wins. (This used to assume
+        // a patch was only ever used where it helped, which is how a coarse
+        // far-field patch smearing the foreground went unmeasured.)
+        const w = [0, 1, 2].map((k) => wt(this.texHalf[k], r));
+        const tx = this.texHalf.map((hm, k) => 2 * hm / sizes[k]);
+        const ladderT = tx[3] + (tx[2] - tx[3]) * w[2];
+        const ladderT1 = ladderT + (tx[1] - ladderT) * w[1];
+        const ladderBlend = ladderT1 + (tx[0] - ladderT1) * w[0];
+        let finest = null;
+        for (const pt of patches) {
+          const ux = Math.abs(x - pt.x) / pt.half, uy = Math.abs(y - pt.y) / pt.half;
+          if (Math.max(ux, uy) > 0.88) continue;
+          if (pt.texel >= 0.8 * ladderBlend) continue;
+          if (!finest || pt.texel < finest.texel) finest = pt;
+        }
+        if (finest) { got = Math.max(finest.texel, minor, major / aniso); by = 'patch'; }
+        out.push({ sx, sy, need, got, ratio: got / need, by, dist: d3 });
+      }
+    }
+    return out;
+  };
+
   Pano3D.prototype.load = function (header, buffer) {
     const gl = this.gl;
+    // Imagery cut for another point must never be drawn on this mesh: it
+    // sits offset by however far apart the two are, and the sharp near
+    // levels cover the wrong ground, so everything looks smeared. Unless the
+    // textures already loading are this point's (the usual case: they are
+    // started from /api/snap before the mesh arrives), fall back to
+    // land-cover colours and drop whatever is still in flight.
+    if (!this.texFor(header.lat, header.lon)) {
+      this.texReady = false;
+      this._texFor = null;
+      this._texToken++;
+      for (const sl of this.focusSlots) { sl.token++; sl.patch = null; sl.pending = null; }
+    }
     const { n_r, counts, offsets, radii } = header;
     const n = header.n_vert;
     const z = new Float32Array(buffer, 0, n);
@@ -873,7 +1028,7 @@
     // focus patches bound coarsest first, so the finest is blended last
     const patches = this.focusSlots.filter((sl) => sl.patch)
       .sort((a, b) => b.patch.texel - a.patch.texel);
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < FOCUS_N; i++) {
       const sl = patches[i];
       gl.activeTexture(gl.TEXTURE4 + i);
       gl.bindTexture(gl.TEXTURE_2D, sl ? sl.tex : this.tex[4 + i]);
@@ -882,9 +1037,11 @@
       gl.uniform4f(gl.getUniformLocation(this.terrainProg, `uFocus${i}`),
         p ? p.x : 0, p ? p.y : 0, p ? p.half : 1, p ? p.texel : 0);
     }
-    gl.uniform1f(gl.getUniformLocation(this.terrainProg, 'uPix'), this.pixAngle());
     gl.uniform4f(gl.getUniformLocation(this.terrainProg, 'uHalf'),
       this.texHalf[0], this.texHalf[1], this.texHalf[2], this.texHalf[3]);
+    const ts = this.texSizes || [2048, 4096, 4096, 2048];
+    gl.uniform4f(gl.getUniformLocation(this.terrainProg, 'uTexel'),
+      ...this.texHalf.map((hm, i) => 2 * hm / ts[i]));
     gl.uniform1f(gl.getUniformLocation(this.terrainProg, 'uTexMix'),
       (this.texWanted && this.texReady) ? 1 : 0);
     gl.uniform3f(gl.getUniformLocation(this.terrainProg, 'uHazeColor'), 0.72, 0.78, 0.85);

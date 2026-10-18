@@ -25,7 +25,7 @@ photographs or image models are involved.
 | Combining `V` with ruggedness `R` into one score | 🔜 designed, not built |
 | Canopy occlusion in `V` (trees block sightlines) | ✅ working |
 | Built-up gating of candidate points | 🔜 layer exists, gate not applied |
-| Scoring every trail, peak, pass and lake, ranked in the viewer | ✅ working (one AOI, GPU) |
+| Scoring every trail, peak, pass, lake and camp, ranked and filterable in the viewer | ✅ working (one AOI, GPU) |
 | More AOIs: Alps, Scandinavia, Pyrenees | 🔜 sources chosen, nothing pulled |
 
 The viewer came first because terrain data is hard to trust sight-unseen:
@@ -44,8 +44,15 @@ the data is rebuilt from public sources locally.
 ## Quick start
 
 Only one AOI is set up so far: **Alpine Lakes Wilderness**, central WA Cascades.
-Expect the first build to pull ~11 GB and take a couple of hours, most of it
-NAIP aerial imagery.
+Expect the first build to keep ~15 GB and take a couple of hours, most of it
+NAIP aerial imagery (about 50 GB streamed for a 7.7 GB mosaic).
+
+The data goes in `data/` unless you point it elsewhere. Put it on a fast
+disk with room: the tiler and the panorama read it hard. Either set
+`VISTARAMA_DATA`, or create an untracked `vistarama.local.json` at the repo
+root such as `{"data_root": "C:/data/vistarama"}`. The AOI definitions in
+`data/aoi/` stay in the repo either way; `serve.py` maps `/data/` onto the
+data root.
 
 ```bash
 python -m pip install rasterio numpy scipy pyproj shapely requests pillow
@@ -120,8 +127,12 @@ the water with the forest at its back, which a per-point gate cannot do.
 
 ## "View from here" — interactive 3D
 
-Click anywhere on the map (Alt-click opens a feature's tags instead). A pane
-opens at the bottom with a WebGL rendering of the surrounding terrain.
+Press **V** with the cursor anywhere over the map, or click a trail, peak,
+pass, lake, camp or viewpoint. A click on empty map only clears the ranked
+list's selection, and Alt-click opens a feature's tags. A pane opens at the
+bottom with a WebGL rendering of the surrounding terrain, with the view score
+for that spot in its lower-left corner: collapsed to the score, expanded for
+the breakdown.
 
 - **Drag** to look around, **scroll** to zoom (fov 8° to 100°).
 - **Eye** slider: 2 m to 2 km above the ground. **Range**: 10 to 517 km,
@@ -161,7 +172,7 @@ A trail that OSM splits into several ways is highlighted whole, all of it
 drawn the same, and the card gives both lengths in one row: this segment of
 the whole trail, with its segment count. Once a trail has a view score,
 hovering it also marks its best point, the highest-V point found on the path
-(see "Trails, peaks, passes and lakes"), with a white dot labelled with just that V. A multi-segment trail gets one such dot
+(see "Trails, peaks, passes, lakes and camps"), with a white dot labelled with just that V. A multi-segment trail gets one such dot
 at every segment's best point, the trail's best among them; where two labels
 would collide the lower one moves to another side of its dot, or is left off. The card gives the trail's average V and,
 on a multi-segment trail, the hovered segment's. Per-segment
@@ -218,11 +229,43 @@ check on that machinery before the metric is wired up.
   a pale horizon colour in the fragment shader.
 - When you zoom in, the screen resolves more than those squares hold (at
   fov 8°, Cashmere from 9 km needs ~1.4 m/texel and the ladder had 14.6). Once
-  the view settles, up to four **focus patches** of 2048² are fetched where
-  they gain the most sharpness per screen pixel, from 2 m (the NAIP mosaic's
-  own resolution) up. They cost the same VRAM the ladder used to spend on a
-  zoomed-in 4096² near level, and fade out wherever they would be minified,
-  since they have no mipmaps.
+  the view settles, up to twelve **focus patches** of 2048² are fetched where
+  they gain the most sharpness per screen pixel, from 0.6 m (the NAIP mosaic's
+  own resolution) up. Twelve is what the sixteen texture units allow beside
+  the four ladder levels; they are mipmapped, so a patch keeps serving the
+  ground beyond the distance it was cut for.
+- **Textures are tied to the point they were cut for.** The panorama records
+  that point, and a mesh built for any other point never draws with them: it
+  shows land-cover colours until its own imagery arrives, and fetches it
+  itself if nothing else did. Without this, a load that skipped the imagery
+  left the previous viewpoint's textures in place, 2 km out of register, and
+  since the sharp near levels then covered the wrong ground the whole view
+  looked smeared. A level that fails to load is retried, then dropped.
+- **Every texture is anisotropically filtered** (16×). Trilinear filtering
+  picks its mip level from the longer axis of a pixel's footprint, and terrain
+  seen obliquely is stretched along the line of sight many times over, so it
+  fell to a far blurrier level than the texture held.
+- **How sharp is sharp enough** is measured, not guessed: `textureAudit()` in
+  `pano3d.js` emulates, for a grid of screen pixels, the texel the shader
+  actually samples (ladder level, mip level, patch) and compares it with what
+  the screen can show there, the pixel's footprint across the line of sight
+  but never finer than the best source (0.6 m NAIP in the core, 10 m
+  Sentinel-2 outside). Over 48 views on a 2293×1175 canvas, two summits, a
+  lakeshore and a valley at fov 55 to 8: with four unmipmapped patches and no
+  anisotropic filtering 26% of pixels were more than 1.25× softer than they
+  could be; anisotropic filtering alone brought that to 18%; twelve mipmapped
+  patches to 3.8% (90th percentile 1.10×), by that audit. But the audit then
+  assumed a patch was drawn only where it helped, and the shader drew a
+  patch everywhere inside its square, so a coarse patch planned for the far
+  field (56 m texels over 114 km) smeared the whole foreground in views that
+  had one, unmeasured. Patches now fade out wherever they are no finer than
+  the ladder beneath, and the audit models exactly that: over 24 views at the
+  panorama's default size (1030×406), Stuart's summit and Colchuck's shore at
+  fov 55 to 8, 1.9% of pixels are more than 1.25× soft, at worst 9% in one
+  zoomed summit view, where twelve patches cannot cover every distance at
+  full detail.
+  Frame time stays ~3 ms; the patches cost ~270 MB of texture and a few
+  seconds of streaming after a view settles.
 - Raw WebGL, no framework: `pano3d.js` is ~1,200 lines including the mat4
   helpers.
 
@@ -501,9 +544,9 @@ Bands the DEM edge cuts short are starred; their V is a lower bound. From the
 middle of this AOI that only affects the 60–150 km bands, which carry ~6% of a
 summit's score.
 
-### Trails, peaks, passes and lakes
+### Trails, peaks, passes, lakes and camps
 
-Hover a trail, peak, pass or lake on the map and press **V** to score it. The
+Hover a trail, peak, pass, lake or camp on the map and press **V** to score it. The
 result goes into the feature's hover card and is stored, so it is shown again
 on later hovers without recomputing, across reloads
 (`scripts/featurescore.py`, `data/derived/<aoi>/feature_scores.json`).
@@ -534,6 +577,12 @@ on later hovers without recomputing, across reloads
   into another mountain) the node is scored where it is: slightly low rather
   than the wrong mountain.
 - **Passes** are scored at the node. Snapping would climb out of the saddle.
+- **Camps** (campsites, huts and trail shelters) are scored at the node, or at
+  a point inside a campsite mapped as an area. They come from the same OSM
+  download as viewpoints, springs and drinking water, which the map now shows
+  as two layers: **Camps**, with the water sources alongside (not scored), and
+  **Viewpoints**. Bus, picnic and gazebo shelters are in neither
+  (`featurescore.poi_kind` decides, for the tiles and the scores alike).
 - **Lakes** are scored along their shoreline, the way a trail is along its
   path: a point every 50 m around each outer ring (islands are left out),
   averaged, and the same along-the-path search for the best point, wrapping
@@ -564,10 +613,10 @@ is one, so even a long trail scores in about a second.
 
 ### Scoring everything, and the ranked list
 
-`scripts/score_all.py` scores every peak and pass inside the core box, every
-lake touching it and every trail with a way inside it: 7,030 items (496 of
-them lakes), 120,690 samples at 50 m plus the best-point search, in about 4
-minutes on the GPU. It skips anything already stored under the
+`scripts/score_all.py` scores every peak, pass and camp inside the core box,
+every lake touching it and every trail with a way inside it: 7,226 items (496
+lakes, 196 camps), 120,886 samples at 50 m plus the best-point search, in
+about 4 minutes on the GPU. It skips anything already stored under the
 current version, so it resumes after an interruption, and writes the store
 and a status file after each chunk.
 
@@ -578,8 +627,8 @@ GPU the exhaustive run costs a couple of minutes, so they would save seconds
 while risking exactly the scenic stretches a ranking exists to find. Without
 a GPU (hours of CPU) they would be worth revisiting.
 
-The **ranked list** on the right shows every scored trail, peak, pass or
-lake, and sorts by any column: V (the average along a trail or shoreline),
+The **ranked list** on the right shows every scored trail, peak, pass, lake
+or camp, and sorts by any column: V (the average along a trail or shoreline),
 best V (its highest point), length (a lake's shoreline), minimum and maximum
 elevation, and elevation gain; the Lakes tab shows each lake's area instead
 of gain, and its surface elevation as Max.
@@ -588,8 +637,29 @@ the profile has climbed 5 m from its last turning point, so DEM ripple adds
 nothing, and takes each segment in its more uphill direction, since a
 branching trail has no single direction. Peaks and passes show their OSM
 elevation (the DEM at a summit is typically ~10 m low, up to ~25 m, as a
-30 m grid rounds off sharp tops). Selecting a row zooms the map to the item, switches its layer on
-if needed, and marks it (a lake gets an outline). While a bulk job runs, the
+30 m grid rounds off sharp tops).
+
+What the list covers is either the **visible area** of the map (the default)
+or a **box** dragged out on the map, and a **search** box filters by name as
+you type, across the whole region. The server answers one page at a time
+(`scripts/scoreindex.py`), since a region has far more items than a browser
+should download. A selection lasts only while the item passes the list's
+filters: redrawing the box without it, switching type, a search that misses
+it, or panning it out of the visible area drops it, as does clicking its row
+again or clicking empty map. Selecting a row switches the item's layer on if
+needed and marks it (a lake gets an outline); the map moves to it only when
+that cannot change the list (in Box mode, or with a search), and never closer
+than zoom 13 unless a long trail needs it further out. It also opens the panorama
+at the item's best point (a trail's or lake's highest-V point, a peak's
+scored summit, a pass's node), unsnapped, so the panel's V is the stored
+best, and turns the camera to face the most V: the heading whose horizontal
+field of view holds the largest share of the point's V by direction, pitched
+half way up to the skyline there, so a wall over a lake is framed and a
+summit's panorama sits on the horizon. The heading is found when the item is
+scored (`vscore.best_heading`, from the per-ray V and skyline of the GPU
+march, over an 80° window) and stored with it, so the camera and the map's
+view wedge face it the moment the row is selected rather than turning once
+the panorama has loaded. While a bulk job runs, the
 list shows its progress and fills in as chunks land.
 
 The lake ranking is led by the high cirque lakes under the glaciated peaks
@@ -598,6 +668,18 @@ around Mount Daniel and Mount Hinman: Venus Lake (1.92 along the shore, best
 Colchuck Lake averages 1.14 but is seventh by best point (1.94, its south end
 under Dragontail). Forested lakes such as Mig and Hope Lake near Stevens Pass
 come last.
+
+**Filter by view score** (left pane) hides every scorable item below a
+threshold, on the map and in the ranked list, while the slider is dragged. A
+toggle picks what is compared: the **average** V of a trail or shoreline, or
+its **best** point; a peak, pass or camp has one V either way. The slider is
+quadratic, so most of its travel covers the low values where most trails sit.
+A scorable item without a stored score (a lake outside the core box nobody
+has pressed V on) hides too once the threshold is above zero, since it cannot
+be shown to pass; features that are never scored (roads, rivers, ponds, water
+sources) are left alone. Hidden features stay on the map unstroked and stop
+taking the mouse, so each drag step only restyles the features whose state
+flips: 3-11 ms with ~9,000 on screen.
 
 Trails default to 1 km and up. Averaged V favours the very short: a 10 m spur
 on a summit or a 100 m bootpath averages higher than any real trail, and
@@ -665,7 +747,8 @@ scripts/
   serve.py        local HTTP server and the /api endpoints
   aoi.py, colormaps.py
 viewer/     Leaflet map + WebGL panorama (Leaflet vendored, works offline)
-data/       not in git; see data/README.md
+data/       AOI definitions (tracked); the built data lives here too unless
+            vistarama.local.json moves it (see data/README.md)
 ```
 
 ## Pipeline
@@ -673,7 +756,7 @@ data/       not in git; see data/README.md
 ```
 raw (as published)       3DEP DEM, ESA WorldCover, OSM via Overpass,
                          Sentinel-2 (UTM), Kirmse prominence
-   ↓ mosaic + warp       (NAIP is warped straight into interim/ at 2 m)
+   ↓ mosaic + warp       (NAIP is warped straight into interim/ at 0.6 m, JPEG)
 interim (EPSG:5070)      equal-area, so metres mean metres
    ↓ derive
 derived (EPSG:5070)      hillshade, slope, ruggedness, relief, openness,
@@ -986,6 +1069,32 @@ Each of these produced a plausible-looking but wrong result:
   grid. That made each 0.6 m NAIP quad take 150 s, about 15 hours for this
   AOI. Read with `out_shape` first (which *does* use the overview pyramid),
   then warp the small array: ~18 s per quad.
+- **NAIP at 0.6 m costs disk only if stored uncompressed.** The quads are
+  4-band (RGB + near-infrared) DEFLATE, which barely compresses photographs: a
+  2023 quad is 458 MB against 442 MB raw, and the near-infrared comes along
+  whether or not it is wanted. The mosaic is where the size is won: JPEG in
+  YCbCr at quality 88 is ~8× smaller with no visible artefacts: 7.7 GB for
+  the core at 0.6 m with overviews, the same as the old uncompressed 2 m
+  mosaic and against ~63 GB uncompressed. A compressed TIFF must have each block written once, though, so
+  `imagery.py` builds in 2048-row strips top to bottom (every quad crossing a
+  strip read for just that band, merged, written), fetches only inside the
+  core's lon/lat box (the mosaic's slanted corners would be a third of the
+  transfer), and resumes from the last strip written. About 50 GB streamed.
+- **Throughput is connections in flight.** One connection to the NAIP blobs
+  gives 1-2 MB/s. Fetching each quad's share of a strip as 2048-column
+  pieces, 48 at once, built the core in about an hour (67 minutes with
+  the overviews).
+- **Trust a SAS token's stated expiry, and refresh it once.** The tokens say
+  they last 45 minutes; the code assumed 50, so for five minutes in every
+  fifty every read failed with HTTP 403. Each of the 48 failing workers then
+  forced a refresh, and the token service answered the flood with HTTP 429
+  for minutes. Now the stated expiry (less five minutes) is used, a worker
+  reports which token failed and only that one is replaced, and a 429 is
+  waited out with the lock held so nobody else asks meanwhile.
+- **A window that misses the image is not a failed read.** Footprints from a
+  quad's lon/lat bbox are a little larger than its image, so some pieces
+  miss it; rasterio raises on an empty intersection, and the retry loop took
+  that for a network error and retried it with fresh tokens.
 - **A blob host's per-connection rate says nothing about its bandwidth.** NAIP
   from `naipeuwest` measured 0.78 MB/s on one connection, 2.95 on four and 6.66
   on twelve. Fetch quads concurrently and serialise only the writes; a GDAL
@@ -1098,18 +1207,13 @@ missing.
   downloaded. The imagery path carries over, since Sentinel-2 is global and its
   selection logic is AOI-agnostic. NAIP is US-only and simply absent, which the
   priority-ordered source list already handles.
-- **NAIP has visible mixed-year seams.** 126 quads are from 2023 and 38 from
-  2015–2019, and the tonal step between them follows quad boundaries. Whether
-  2023 coverage exists for those quads in Planetary Computer's catalogue is
-  unverified; if it does, it is a dedupe-key bug, and if not the options are
-  histogram matching or falling back to Sentinel-2 there.
+- **NAIP has mixed-year seams.** Each quad takes its finest flight, then a
+  summer one, then the newest: 149 of the 187 are 2023, 23 are August 2019
+  and 15 July 2021 (where 2023 was flown in October, with fresh snow), all at
+  0.6 m. The tonal step between years follows quad boundaries; histogram
+  matching would hide it.
 - **Panorama load is ~5.4 s warm**, dominated by the four imagery textures
   (~5.1 s). Profiling put ~55% of that in GDAL's `reproject` and ~40% in the
   windowed read. Two hypotheses were tested and both refuted: a process pool
   (GIL) gained almost nothing on 32 cores, and DEFLATE compression made it
   ~1.6× *slower*. Raising `WARP_THREADS` to 16 is the one thing that helped.
-- **NAIP is stored at 2 m, not its native 0.6 m.** At the tightest zoom
-  (fov 8°) the screen resolves ~1.4 m on terrain 9 km away, so close-up
-  imagery is still a little soft. Keeping 0.6 m for this AOI would be ~63 GB
-  of uncompressed RGB against 7.7 GB now; the alternative is fetching 0.6 m on
-  demand for the focus patches only.

@@ -229,6 +229,40 @@ def version_tag() -> str:
     return f"v{ALGORITHM_VERSION}-{h[:10]}"
 
 
+# The heading a point is best seen in: the window of this many degrees of
+# azimuth holding the most V (about the panorama camera's horizontal field of
+# view), pitched HEADING_PITCH_SHARE of the way up to the skyline at its
+# centre, within the limits. Stored with each scored feature, so the viewer
+# can face it the moment the feature is selected.
+HEADING_FOV_DEG = 80
+HEADING_PITCH_SHARE = 0.5
+HEADING_PITCH_LIMITS = (-10.0, 20.0)
+
+
+def best_heading(v_deg, horizon_deg) -> dict:
+    """{yaw, pitch} from 1-degree bins of V and of the skyline angle."""
+    v = np.asarray(v_deg, float)
+    n = v.size
+    w = max(1, min(n, HEADING_FOV_DEG))
+    ext = np.concatenate([v, v[:w]])
+    cs = np.concatenate([[0.0], np.cumsum(ext)])
+    start = int(np.argmax(cs[w:w + n] - cs[:n]))
+    yaw = (start + w / 2.0) % 360.0            # bin i covers [i, i + 1) degrees
+    sky = float(np.asarray(horizon_deg, float)[int(yaw) % n])
+    lo, hi = HEADING_PITCH_LIMITS
+    pitch = min(hi, max(lo, HEADING_PITCH_SHARE * sky))
+    return {"yaw": round(yaw, 1), "pitch": round(pitch, 1)}
+
+
+def heading_from_rays(v_rays, hz_rays_deg) -> dict:
+    """best_heading from per-ray V and skyline angles (N_AZ rays)."""
+    v = np.asarray(v_rays, float)
+    h = np.asarray(hz_rays_deg, float)
+    per = v.size // 360
+    return best_heading(v.reshape(360, per).sum(axis=1),
+                        h.reshape(360, per).max(axis=1))
+
+
 def _class_lut() -> np.ndarray:
     lut = np.full(256, UNKNOWN_WEIGHT, dtype=np.float64)
     for code, (_name, w) in CLASS_WEIGHTS.items():

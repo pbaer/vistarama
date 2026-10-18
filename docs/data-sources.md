@@ -416,11 +416,13 @@ back to the next, so the same code works in Washington and in the Alps.
 - **Not Earth Search for NAIP.** It also carries a `naip` collection, but its
   asset hrefs are `s3://naip-analytic/...` — a **requester-pays** bucket, which
   needs AWS credentials and bills the caller.
-- **Quad selection:** summer acquisitions beat recency. A late-October quad
+- **Quad selection:** finest ground sample first (0.6 m flights since 2019
+  over the 1 m ones before), then summer over recency: a late-October quad
   carries fresh snow that an August quad two years older does not.
-- **Cost:** ~187 quads for the core AOI, ~35 minutes at 12 concurrent
-  connections, 7.7 GB at 2 m including overviews. Native 0.6 m over the same
-  90 × 84 km would be ~63 GB of uncompressed RGB before overviews.
+- **Cost:** 187 quads for the core AOI, ~50 GB streamed (4-band DEFLATE
+  barely compresses, and the near-infrared comes along), about an hour at
+  48 concurrent connections. Stored at the native 0.6 m as JPEG/YCbCr q88:
+  7.7 GB with overviews, against ~63 GB uncompressed.
 
 ### Ruled out
 

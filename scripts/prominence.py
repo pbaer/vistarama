@@ -32,7 +32,8 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+from aoi import AOI_DIR, DATA
+
 FT = 0.3048
 
 # How far an OSM node may sit from a Kirmse summit and still be the same
@@ -74,19 +75,20 @@ def _peak_ele(props: dict) -> float | None:
 
 
 def main() -> int:
-    slug = "alpine-lakes"
-    aoi = json.loads((ROOT / "data" / "aoi" / f"{slug}.json").read_text("utf-8"))
+    import sys
+    slug = sys.argv[1] if len(sys.argv) > 1 else "alpine-lakes"
+    aoi = json.loads((AOI_DIR / f"{slug}.json").read_text("utf-8"))
     b = aoi["buffered"]
     bbox = (b["west"], b["south"], b["east"], b["north"])
 
-    zp = ROOT / "data" / "raw" / "prominence" / "kirmse_prominence.raw"
+    zp = DATA / "raw" / "prominence" / "kirmse_prominence.raw"
     if not zp.exists():
         log(f"missing {zp} — download it first")
         return 1
     k = load_kirmse(zp, bbox)
     log(f"{len(k)} Kirmse summits inside the buffered AOI")
 
-    peaks_path = ROOT / "data" / "raw" / "osm" / f"{slug}_peaks.geojson"
+    peaks_path = DATA / "raw" / "osm" / f"{slug}_peaks.geojson"
     gj = json.loads(peaks_path.read_text(encoding="utf-8"))
     feats = [f for f in gj.get("features", [])
              if (f.get("geometry") or {}).get("type") == "Point"]
@@ -117,7 +119,7 @@ def main() -> int:
         dists.append(float(d[i]))
         matched += 1
 
-    dst = ROOT / "data" / "interim" / slug / "peak_prominence.json"
+    dst = DATA / "interim" / slug / "peak_prominence.json"
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(json.dumps({
         "source": "Kirmse & de Ferranti global prominence (p100)",

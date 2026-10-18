@@ -161,7 +161,9 @@ Straightforward — Sonny 1″ covers both completely.
 
 Imagery for the panorama comes on top of that (see
 [data-sources.md](data-sources.md#e-true-colour-imagery)). For Alpine Lakes
-alone it was ~0.8 GB of Sentinel-2 at 10 m and ~7.7 GB of NAIP at 2 m. NAIP is
+alone it is ~0.8 GB of Sentinel-2 at 10 m and ~7.7 GB of NAIP at its native
+0.6 m, JPEG-compressed (as much as the first build's 2 m stored
+uncompressed). NAIP is
 US-only; Sentinel-2 covers every target.
 
 Optional / later:

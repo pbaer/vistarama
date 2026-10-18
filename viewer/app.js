@@ -5,7 +5,8 @@
  * swapped as you zoom, so we never hand the browser a 100 MB GeoJSON.
  */
 
-const AOI = 'alpine-lakes';
+// ?aoi=<slug> picks the region (wa-west); Alpine Lakes until it replaces it
+const AOI = new URLSearchParams(location.search).get('aoi') || 'alpine-lakes';
 const DATA_ROOT = `/data/web/${AOI}/`;
 
 // zoom -> vector detail tier
@@ -18,7 +19,7 @@ const TIER_ORDER = ['low', 'mid', 'high'];
 
 // Themes that should be *hidden* below a tier rather than fall back to a finer
 // one. `resolveTier` climbs upward when nothing coarse enough exists, which is
-// what `passes` and `poi` want — they only ship at `high` and should still be
+// what `passes`, `camps` and `viewpoints` want — they only ship at `high` and should still be
 // drawn when zoomed out. Trails are the opposite case: dropping `trails.low`
 // to declutter z8 instead promoted them to the full 20k-feature `mid` tier,
 // which is strictly worse than what it replaced.
@@ -38,10 +39,12 @@ const DEFAULT_ON = ['hillshade', 'dem'];
 // Imagery is a base image, not a measurement painted over one, so it goes on
 // opaque. NAIP sits above Sentinel-2 wherever it exists.
 const DEFAULT_OPACITY = { hillshade: 1.0, dem: 0.75, imagery_s2: 1.0, imagery_naip: 1.0 };
+// one blue for open water: rivers, streams, lakes and their outlines
+const WATER_BLUE = '#2f6f9f';
 
 const VECTOR_ORDER = [
   'protected', 'glaciers', 'water_areas', 'water_lines',
-  'roads', 'trails', 'passes', 'poi', 'peaks',
+  'roads', 'trails', 'passes', 'camps', 'viewpoints', 'peaks',
 ];
 
 // ---------------------------------------------------------------------------
@@ -153,20 +156,21 @@ const VECTOR_STYLE = {
         : ['pond', 'lagoon', 'basin'].includes(p.water) ? 'pond'
           : p.water === 'river' ? 'riverbank' : 'lake'),
     classes: {
-      lake: { label: 'Lake', color: '#6bb6e8', weight: 0.9, fill: '#2f6f9f', fillOpacity: 0.8 },
-      reservoir: { label: 'Reservoir', color: '#6bb6e8', weight: 0.9, fill: '#2b5f86', fillOpacity: 0.8, dashArray: '5,3' },
-      pond: { label: 'Pond / basin', color: '#7fc4ee', weight: 0.7, fill: '#3b82ad', fillOpacity: 0.75 },
-      riverbank: { label: 'River surface', color: '#5aa9df', weight: 0.6, fill: '#356f96', fillOpacity: 0.7 },
-      _default: { label: 'Water', color: '#6bb6e8', weight: 0.8, fill: '#2f6f9f', fillOpacity: 0.75 },
+      // outlines in the water's own blue, the same blue as the rivers
+      lake: { label: 'Lake', color: WATER_BLUE, weight: 0.9, fill: WATER_BLUE, fillOpacity: 0.8 },
+      reservoir: { label: 'Reservoir', color: WATER_BLUE, weight: 0.9, fill: '#2b5f86', fillOpacity: 0.8, dashArray: '5,3' },
+      pond: { label: 'Pond / basin', color: WATER_BLUE, weight: 0.7, fill: '#3b82ad', fillOpacity: 0.75 },
+      riverbank: { label: 'River surface', color: WATER_BLUE, weight: 0.6, fill: '#356f96', fillOpacity: 0.7 },
+      _default: { label: 'Water', color: WATER_BLUE, weight: 0.8, fill: WATER_BLUE, fillOpacity: 0.75 },
     },
   },
   water_lines: {
-    label: 'Rivers & streams', kind: 'line', color: '#4a9fe0',
+    label: 'Rivers & streams', kind: 'line', color: WATER_BLUE,
     classify: (p) => (['river', 'canal', 'stream'].includes(p.waterway) ? p.waterway : '_default'),
     classes: {
-      river: { label: 'River', color: '#4a9fe0', weight: 2.4 },
-      canal: { label: 'Canal', color: '#4a9fe0', weight: 1.7, dashArray: '7,3' },
-      stream: { label: 'Stream', color: '#6fb8ea', weight: 1.0 },
+      river: { label: 'River', color: WATER_BLUE, weight: 2.4 },
+      canal: { label: 'Canal', color: WATER_BLUE, weight: 1.7, dashArray: '7,3' },
+      stream: { label: 'Stream', color: WATER_BLUE, weight: 1.0 },
       _default: { label: 'Ditch / drain', color: '#7c9fb8', weight: 0.7, dashArray: '3,3' },
     },
   },
@@ -224,22 +228,30 @@ const VECTOR_STYLE = {
       _default: { label: 'Pass', color: '#e08cff', shape: 'bowtie', radius: 4 },
     },
   },
-  poi: {
-    label: 'Huts, camps, viewpoints', kind: 'point', color: '#ff7b7b',
+  // camps and viewpoints are both split from the POI download (process.py,
+  // featurescore.poi_kind); the water sources ride along with the camps
+  camps: {
+    label: 'Camps', kind: 'point', color: '#7fd28f',
     classify: (p) => (
-      p.tourism === 'viewpoint' ? 'viewpoint'
-        : p.tourism === 'camp_site' ? 'camp_site'
-          : (p.tourism === 'alpine_hut' || p.tourism === 'wilderness_hut') ? 'hut'
-            : p.amenity === 'shelter' ? 'shelter'
-              : (p.amenity === 'drinking_water' || p.natural === 'spring') ? 'water'
-                : '_default'),
+      (p.tourism === 'camp_site' || p.tourism === 'camp_pitch') ? 'camp_site'
+        : (p.tourism === 'alpine_hut' || p.tourism === 'wilderness_hut') ? 'hut'
+          : p.amenity === 'shelter' ? 'shelter'
+            : (p.amenity === 'drinking_water' || p.natural === 'spring') ? 'water'
+              : '_default'),
     classes: {
-      viewpoint: { label: 'Viewpoint', color: '#ffd98a', shape: 'diamond', radius: 5 },
       camp_site: { label: 'Campsite', color: '#7fd28f', shape: 'tent', radius: 5 },
       hut: { label: 'Hut', color: '#ff9d6e', shape: 'house', radius: 5 },
       shelter: { label: 'Shelter', color: '#d5a6ff', shape: 'square', radius: 4 },
       water: { label: 'Spring / water', color: '#6fc7ff', shape: 'drop', radius: 4.5 },
-      _default: { label: 'Other', color: '#ff7b7b', shape: 'circle', radius: 3.5 },
+      _default: { label: 'Camp', color: '#7fd28f', shape: 'circle', radius: 3.5 },
+    },
+  },
+  viewpoints: {
+    label: 'Viewpoints', kind: 'point', color: '#ffd98a',
+    classify: () => 'viewpoint',
+    classes: {
+      viewpoint: { label: 'Viewpoint', color: '#ffd98a', shape: 'diamond', radius: 5 },
+      _default: { label: 'Viewpoint', color: '#ffd98a', shape: 'diamond', radius: 5 },
     },
   },
   peaks: {
@@ -362,12 +374,16 @@ const vectorRenderer = L.canvas({ tolerance: HIT_TOLERANCE_PX, padding: 0.3 });
 const PANO_OVERLAY_PANE = 'panoOverlay';
 const panoOverlayRenderer = L.canvas({ padding: 0.3, pane: PANO_OVERLAY_PANE });
 
+const MAP_MAX_ZOOM = 18;
 const map = L.map('map', {
   preferCanvas: true,
   renderer: vectorRenderer,
   zoomControl: true,
   minZoom: 6,
-  maxZoom: 15,
+  // the aerial tiles go to z17 (0.8 m/px here, from 0.6 m NAIP); one more
+  // level lets them be inspected up close, every layer stretching its own
+  // finest tiles beyond that
+  maxZoom: MAP_MAX_ZOOM,
 });
 
 map.createPane(PANO_OVERLAY_PANE);
@@ -440,7 +456,7 @@ function buildRasters(layers) {
     const opacity = DEFAULT_OPACITY[spec.id] ?? 0.75;
     const layer = L.tileLayer(DATA_ROOT + spec.url + CACHE_BUST, {
       minZoom: 6,
-      maxZoom: 15,
+      maxZoom: MAP_MAX_ZOOM,
       minNativeZoom: spec.minzoom,
       maxNativeZoom: spec.maxzoom,
       opacity,
@@ -566,14 +582,16 @@ let hovered = null;               // { layer, base, theme }
 // scores are loaded once at start-up and shown in the hover card from then
 // on, across reloads. The server drops any score computed under another
 // version of the method, so what arrives here is always current.
-const SCORABLE_THEMES = new Set(['trails', 'peaks', 'passes', 'water_areas']);
+const SCORABLE_THEMES = new Set(['trails', 'peaks', 'passes', 'water_areas', 'camps']);
 
 /** Whether a hovered feature can be scored. Water areas only when the tiles
  *  mark them as a lake (featurescore.lake_area: standing fresh water of at
  *  least 0.5 ha), so ponds, rivers and basins do not offer V. */
 function isScorable(theme, feature) {
   if (!SCORABLE_THEMES.has(theme) || !feature || !feature.id) return false;
-  return theme !== 'water_areas' || !!feature.lake;
+  if (theme === 'water_areas') return !!feature.lake;
+  if (theme === 'camps') return !!feature.camp;      // not the water sources
+  return true;
 }
 
 /** Records scored along a path: a trail, or a lake's shoreline. */
@@ -582,20 +600,48 @@ const FS_POLL_MS = 500;
 const featureScores = new Map();   // OSM id -> stored score summary
 const featureJobs = new Map();     // OSM id -> { state, done, total, error }
 
+// A region has ~190k scored items, far too many to download, so the map asks
+// the server only for the features its loaded tiles hold (and the ranked list
+// asks for one page at a time, see fetchRank).
+const scoredChunks = new Set();      // [theme, L.GeoJSON] of every loaded chunk
+
+/** Fetch the scores of these OSM ids into featureScores: the ones not cached
+ *  yet, or all of them with `force` (new scores have been written). */
+async function lookupScores(ids, force = false) {
+  const need = [...new Set(ids)].filter((id) => id && (force || !featureScores.has(id)));
+  for (let i = 0; i < need.length; i += 5000) {
+    try {
+      const r = await fetch('/api/feature_lookup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug: AOI, ids: need.slice(i, i + 5000) }),
+      });
+      if (!r.ok) return;
+      for (const [id, rec] of Object.entries(await r.json())) featureScores.set(id, rec);
+    } catch (err) { return; /* server without the endpoint: cards just offer V */ }
+  }
+}
+
+const chunkIds = (layer) => {
+  const ids = [];
+  layer.eachLayer((l) => { if (l.feature && l.feature.id) ids.push(l.feature.id); });
+  return ids;
+};
+
+/** Once a chunk of a scorable theme loads: its scores, then the V filter on
+ *  its features, and the hover card if it shows one of them. */
+async function scoreChunk(theme, layer, force = false) {
+  if (!SCORABLE_THEMES.has(theme)) return;
+  await lookupScores(chunkIds(layer), force);
+  layer.eachLayer((l) => {
+    applyVfTo(theme, l);
+    if (l.feature) refreshHoverCardFor(l.feature.id);
+  });
+}
+
+/** A bulk scoring run has written new scores: refresh every loaded chunk's. */
 async function loadFeatureScores() {
-  try {
-    const r = await fetch(`/api/feature_scores?slug=${AOI}`);
-    if (!r.ok) return;
-    const data = await r.json();
-    // each record once (the ranked list), and every OSM way or node id
-    // mapped to its record (the hover card)
-    featureItems.clear();
-    for (const [key, rec] of Object.entries(data.items || {})) featureItems.set(key, rec);
-    for (const [id, key] of Object.entries(data.ids || {})) {
-      const rec = data.items[key];
-      if (rec) featureScores.set(id, rec);
-    }
-  } catch (err) { /* server without the endpoint: cards just offer V */ }
+  await Promise.all([...scoredChunks].map(([theme, layer]) => scoreChunk(theme, layer, true)));
 }
 
 /** Re-render the card if `fid` is the feature under the cursor. */
@@ -693,7 +739,6 @@ async function scoreFeature(theme, fid) {
     // every way of the trail shares the score; the tiles only know way ids
     featureScores.set(fid, st.record);
     for (const wid of st.record.ways || []) featureScores.set(wid, st.record);
-    featureItems.set(st.record.id, st.record);
     featureJobs.delete(fid);
     renderRank();
   } catch (err) {
@@ -741,17 +786,25 @@ function scoreRows(fid) {
   return rows;
 }
 
+// V over the map. On a scorable item with no score yet (its card says
+// "press V") it scores that item; anywhere else it moves the viewpoint to the
+// cursor, which a plain click no longer does away from an item (see the
+// click handler below).
 document.addEventListener('keydown', (ev) => {
   if (ev.key !== 'v' && ev.key !== 'V') return;
   if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.repeat) return;
   const t = ev.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-  if (!hovered || !isScorable(hovered.theme, hovered.layer.feature)
-      || $('hovercard').hidden) return;
-  const fid = hovered.layer.feature && hovered.layer.feature.id;
-  if (!fid) return;
+  const fid = hovered && hovered.layer.feature && hovered.layer.feature.id;
+  if (fid && isScorable(hovered.theme, hovered.layer.feature) && !$('hovercard').hidden
+      && !featureScores.has(fid)) {
+    ev.preventDefault();
+    scoreFeature(hovered.theme, fid);
+    return;
+  }
+  if (!mapCursor) return;
   ev.preventDefault();
-  scoreFeature(hovered.theme, fid);
+  renderPanorama(mapCursor);
 });
 
 /** Tag values read better without OSM's underscores. */
@@ -1178,6 +1231,8 @@ function makeGeoJsonLayer(theme, data) {
       lyr.on('mouseout', () => hoverEnd(lyr));
       // a chunk swapped out for another LOD tier never sends mouseout
       lyr.on('remove', () => hoverEnd(lyr));
+      // the view score filter, as tiles load
+      if (vfState.min > 0) applyVfTo(theme, lyr);
       // a selected trail or lake in the ranked list stays marked as its
       // tiles reload
       if (theme === 'trails' || theme === 'water_areas') lyr.on('add', () => markRankLayer(lyr));
@@ -1239,7 +1294,14 @@ async function loadChunk(theme, entry, cell) {
     : entry.file) + CACHE_BUST;
   const pending = fetch(url)
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then((data) => makeGeoJsonLayer(theme, data))
+    .then((data) => {
+      const layer = makeGeoJsonLayer(theme, data);
+      if (SCORABLE_THEMES.has(theme)) {
+        scoredChunks.add([theme, layer]);
+        scoreChunk(theme, layer);
+      }
+      return layer;
+    })
     .catch((err) => { console.warn('vector load failed', url, err); return null; });
   state.cache[key] = pending;
   return pending;
@@ -1696,14 +1758,20 @@ function updatePanoFovOnMap(p) {
   if (key === panoFovKey) return;         // nothing moved; skip the redraw
   panoFovKey = key;
   syncViewpointToCamera(c);
+  drawPanoFov(c.lat, c.lon, p.yaw, hfov, h.range_km);
+}
 
-  const R = h.range_km * 1000;
-  const pts = [[c.lat, c.lon]];
+/** The view wedge itself: from (lat, lon), `hfov` degrees wide about `yaw`,
+ *  out to `rangeKm`. Also drawn straight from a ranked-list selection, before
+ *  the panorama it describes has loaded. */
+function drawPanoFov(lat, lon, yaw, hfov, rangeKm) {
+  const R = rangeKm * 1000;
+  const pts = [[lat, lon]];
   const n = 24;
   for (let i = 0; i <= n; i++) {
-    pts.push(destPoint(c.lat, c.lon, p.yaw - hfov / 2 + hfov * i / n, R));
+    pts.push(destPoint(lat, lon, yaw - hfov / 2 + hfov * i / n, R));
   }
-  const axis = [[c.lat, c.lon], destPoint(c.lat, c.lon, p.yaw, R)];
+  const axis = [[lat, lon], destPoint(lat, lon, yaw, R)];
 
   if (!panoFov) {
     // The wedge competes with hillshade, imagery and a dense trail network, so
@@ -1793,8 +1861,14 @@ document.addEventListener('mousedown', (ev) => {
     ? { x: ev.clientX, y: ev.clientY } : null;
 }, true);
 
+// Items a click moves the viewpoint to: places to stand and look from.
+// Anywhere else (empty map, a road, a river) a click only clears the ranked
+// list's selection; the V key moves the viewpoint there instead.
+const VIEWPOINT_THEMES = new Set([...SCORABLE_THEMES, 'viewpoints']);
+
 document.addEventListener('click', (ev) => {
   if (ev.button !== 0 || ev.altKey || !pickTarget(ev)) return;
+  if (rankBoxDrawing) { ev.preventDefault(); ev.stopPropagation(); return; }
   // a click that ends a pan should not drop a viewpoint
   if (!pickDownPt || Math.hypot(ev.clientX - pickDownPt.x,
     ev.clientY - pickDownPt.y) > 6) { pickDownPt = null; return; }
@@ -1803,9 +1877,18 @@ document.addEventListener('click', (ev) => {
   ev.stopPropagation();          // keeps Leaflet from opening a feature popup
   // the second click of a double-click is a zoom, not a second pick
   if (ev.detail > 1) return;
+  if (!hovered || !VIEWPOINT_THEMES.has(hovered.theme)) {
+    if (rankSel) { clearRankSelection(); renderRank(); }
+    return;
+  }
   const latlng = map.containerPointToLatLng(map.mouseEventToContainerPoint(ev));
   renderPanorama(latlng);
 }, true);
+
+// where the cursor is over the map, for the V key
+let mapCursor = null;
+map.on('mousemove', (e) => { mapCursor = e.latlng; });
+map.on('mouseout', () => { mapCursor = null; });
 
 // Label budget. A wide view can put 400+ named summits on screen at once, and
 // labelling them all is unreadable — so only the most prominent get a standing
@@ -2016,6 +2099,7 @@ $('pano-canvas').addEventListener('mouseleave', () => {
 
 async function renderPanorama(latlng, opts) {
   const seq = ++panoSeq;
+  if (!(opts && opts.aim)) panoAim = null;   // a click elsewhere wins
   panoLatLng = latlng;
   const rangeKm = sliderToRange(+$('pano-range').value);
 
@@ -2065,6 +2149,12 @@ async function renderPanorama(latlng, opts) {
   }
   pano.texReady = false;
   pano._texToken++;
+  // a ranked-list selection's heading, set before the mesh so nothing (the
+  // first frame, the map's wedge) ever shows the previous one
+  if (opts && opts.view) {
+    pano.yaw = ((opts.view.yaw % 360) + 360) % 360;
+    pano.pitch = opts.view.pitch;
+  }
 
   let header, payload;
   // Imagery is kicked off from a cheap snap lookup rather than waiting for the
@@ -2112,6 +2202,8 @@ async function renderPanorama(latlng, opts) {
   try {
     pano.eyeHeight = sliderToEye(+$('pano-height').value);
     pano.load(header, payload);
+    // a ranked-list selection whose score arrived before the mesh
+    if (panoAim && panoAim.heading) { pano.setView(panoAim.heading); panoAim = null; }
     // Wait for the imagery before revealing the panorama. Showing the mesh as
     // soon as it uploads meant every load flashed land-cover colours for a
     // second and then snapped to satellite, which reads as a glitch. The
@@ -2125,6 +2217,13 @@ async function renderPanorama(latlng, opts) {
     if (texturePromise) {
       setPhase('fetching imagery…', 'satellite texture, 4 detail levels');
       await texturePromise;
+      if (seq !== panoSeq) { stopTicker(); return; }
+    }
+    // Whatever kept the snap-started load from running (a failed snap
+    // lookup, a surface switch mid-load), this mesh gets its own imagery.
+    if (imageryAvailable() && pano.texWanted && !pano.texFor(header.lat, header.lon)) {
+      setPhase('fetching imagery…', 'satellite texture, 4 detail levels');
+      await pano.loadTextures(header.lat, header.lon, AOI, rangeKm);
       if (seq !== panoSeq) { stopTicker(); return; }
     }
   } catch (err) {
@@ -2498,6 +2597,15 @@ function renderViewScore(d) {
   $('vscore').classList.remove('stale');
   vsMainV = d.V;
   vsUnits = d.units || vsUnits;
+  // a ranked-list selection waiting for this point's score: face its best.
+  // The score can land before the mesh (it may come straight from the
+  // cache), so the heading is kept until renderPanorama has loaded it.
+  if (panoAim && pano && d.by_azimuth
+      && Math.abs(d.lat - panoAim.lat) < AIM_TOL_DEG
+      && Math.abs(d.lon - panoAim.lon) < AIM_TOL_DEG) {
+    panoAim.heading = bestHeading(d, panoHfovDeg(pano));
+    if (pano.data) { pano.setView(panoAim.heading); panoAim = null; }
+  }
   $('vs-value').textContent = vsFmt(d.V);
   setUnits(document.querySelector('#vscore .vs-unit'));
   $('vs-state').textContent = `${d.elapsed_ms} ms`;
@@ -2715,6 +2823,7 @@ function updateVsFov(p) {
   }
 }
 
+// Collapsed (the score only) unless it was last left expanded.
 $('vs-toggle').addEventListener('click', () => {
   const box = $('vscore');
   const collapsed = box.classList.toggle('collapsed');
@@ -2723,12 +2832,12 @@ $('vs-toggle').addEventListener('click', () => {
   try { localStorage.setItem('vs-collapsed', collapsed ? '1' : '0'); } catch (e) { /* private mode */ }
 });
 try {
-  if (localStorage.getItem('vs-collapsed') === '1') {
-    $('vscore').classList.add('collapsed');
-    $('vs-toggle').setAttribute('aria-expanded', 'false');
-    $('vs-toggle').title = 'Expand';
+  if (localStorage.getItem('vs-collapsed') === '0') {
+    $('vscore').classList.remove('collapsed');
+    $('vs-toggle').setAttribute('aria-expanded', 'true');
+    $('vs-toggle').title = 'Collapse';
   }
-} catch (e) { /* storage unavailable: start expanded */ }
+} catch (e) { /* storage unavailable: start collapsed */ }
 
 // ---------------------------------------------------------------------------
 // Ranked list: every scored trail, peak and pass, sortable by V and by the
@@ -2737,7 +2846,92 @@ try {
 // the list refills as chunks land. Selecting a row zooms the map to the item
 // and marks it until something else is selected.
 
+// ---- view score filter ----------------------------------------------------
+//
+// One threshold over every scorable item: a trail's or lake's average V, or
+// its best (the toggle), and a peak's, pass's or camp's own V either way.
+// Items below it are hidden on the map and left out of the ranked list. A
+// scorable item with no stored score cannot be shown to pass, so it hides too
+// once the threshold is above zero. Features that are not scored at all
+// (roads, rivers, ponds, water sources) are left alone.
+//
+// Hidden layers stay on the map, unstroked and unfilled, and stop taking the
+// mouse, so a drag only restyles the layers whose state flips: thousands of
+// trail segments are on screen at once.
+const vfState = { mode: 'avg', min: 0 };
+const VF_STEPS = 1000;             // slider resolution
+
+function vfValue(rec) {
+  if (!rec) return null;
+  return vfState.mode === 'best' && isPathRecord(rec) ? rec.V_max : rec.V;
+}
+
+/** Whether a scored record passes the filter. */
+const vfPasses = (rec) => vfState.min <= 0 || (vfValue(rec) ?? -1) >= vfState.min;
+
+/** The slider's top end: the highest value any record has in this mode,
+ *  which every ranked-list response reports. */
+const vfMax = () => (rankMeta.vmax && rankMeta.vmax[vfState.mode]) || 1;
+
+/** Slider position -> threshold. Quadratic, so the low end, where most
+ *  trails sit, gets most of the travel. */
+const vfFromSlider = (t) => vfMax() * (t / VF_STEPS) ** 2;
+
+function setVfHidden(lyr, hide) {
+  if (!!lyr._vfHidden === hide) return;
+  lyr._vfHidden = hide;
+  if (hide) {
+    if (hovered && hovered.layer === lyr) hoverEnd(lyr);
+    lyr._vfStyle = { stroke: lyr.options.stroke, fill: lyr.options.fill };
+    lyr.options.interactive = false;     // not drawn, and not hoverable
+    lyr.setStyle({ stroke: false, fill: false });
+  } else {
+    lyr.options.interactive = true;
+    lyr.setStyle(lyr._vfStyle || { stroke: true });
+  }
+}
+
+/** Apply the filter to one map feature of a scorable theme. */
+function applyVfTo(theme, lyr) {
+  const f = lyr.feature;
+  if (!f || !isScorable(theme, f)) return;
+  setVfHidden(lyr, !vfPasses(featureScores.get(f.id)));
+}
+
+/** Apply the filter to everything on the map, and to the ranked list. */
+function applyVf() {
+  for (const theme of SCORABLE_THEMES) {
+    const st = vectorLayers[theme];
+    if (!st) continue;
+    st.onMap.forEach((gj) => gj.eachLayer((l) => applyVfTo(theme, l)));
+  }
+  $('vf-val').textContent = vfState.min > 0
+    ? `V ≥ ${vfState.min.toFixed(2)}` : 'off';
+  // with a threshold, the count arrives with the ranked list (drawRank)
+  if (vfState.min <= 0) {
+    $('vf-count').textContent = 'Trails, peaks, passes, lakes and camps below the threshold are hidden on the map and in the ranked list.';
+  }
+  rankState.shown = RANK_PAGE;
+  renderRank();
+}
+
+$('vf-slider').addEventListener('input', (e) => {
+  vfState.min = vfFromSlider(+e.target.value);
+  applyVf();
+});
+$('vf-mode').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-mode]');
+  if (!b || b.dataset.mode === vfState.mode) return;
+  vfState.mode = b.dataset.mode;
+  $('vf-mode').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+  // the same slider position means a different V on another scale
+  vfState.min = vfFromSlider(+$('vf-slider').value);
+  applyVf();
+});
+
 const RANK_PAGE = 200;             // rows rendered per "show more"
+const RANK_FIT_MAX_ZOOM = 13;      // selecting an item never zooms closer than this
+const RANK_SEL_GRACE_MS = 1500;    // a new selection outlives the layout settling
 const RANK_POLL_MS = 2000;         // while a bulk scoring job is running
 const RANK_IDLE_POLL_MS = 15000;   // otherwise, to notice a job started later
 const RANK_COLS = [
@@ -2746,15 +2940,17 @@ const RANK_COLS = [
   ['V', 'V', 'View score: the average along a trail or a lake\'s shoreline, or at a peak or pass',
     (r) => r.V, (v) => v.toFixed(2), true],
   ['V_max', 'Best', 'Highest V anywhere along the trail or shoreline',
-    (r) => (isPathRecord(r) ? r.V_max : null), (v) => v.toFixed(2), true],
+    (r) => (isPathRecord(r) ? r.V_max : null), (v) => v.toFixed(2), true,
+    ['trails', 'water_areas', 'all']],
   ['area_m2', 'Area', 'Lake surface area', (r) => (r.kind === 'shore' ? r.area_m2 : null),
     formatArea, true, ['water_areas']],
   ['length_m', 'Length', 'Trail length (whole trail), or a lake\'s shoreline',
     (r) => (isPathRecord(r) ? r.length_m : null),
-    (v) => (v >= 10000 ? `${(v / 1000).toFixed(0)} km` : `${(v / 1000).toFixed(1)} km`), true],
+    (v) => (v >= 10000 ? `${(v / 1000).toFixed(0)} km` : `${(v / 1000).toFixed(1)} km`), true,
+    ['trails', 'water_areas', 'all']],
   ['ele_min_m', 'Min', 'Lowest elevation, m',
     (r) => r.ele_min_m, (v) => Math.round(v).toLocaleString(), true,
-    ['trails', 'peaks', 'passes', 'all']],   // a lake has one elevation: Max
+    ['trails', 'all']],   // a lake, peak, pass or camp has one elevation: Max
   ['ele_max_m', 'Max', 'Highest elevation, m (a peak, pass or lake: its elevation)',
     (r) => r.ele_max_m, (v) => Math.round(v).toLocaleString(), true],
   ['gain_m', 'Gain', 'Elevation gain, m, each segment walked in its uphill direction',
@@ -2763,43 +2959,77 @@ const RANK_COLS = [
 ];
 // A column with a 7th entry is shown only for those list types.
 const rankCols = () => RANK_COLS.filter((c) => !c[6] || c[6].includes(rankState.type));
-const RANK_THEME_LABEL = { trails: 'trail', peaks: 'peak', passes: 'pass', water_areas: 'lake' };
+const RANK_THEME_LABEL = { trails: 'trail', peaks: 'peak', passes: 'pass', water_areas: 'lake',
+  camps: 'camp' };
 
-const featureItems = new Map();    // record key -> stored summary
 // Trails default to 1 km and up. Averaged V favours the very short: a 10 m
 // spur on a summit or a 100 m bootpath averages higher than any real trail,
 // and without a floor they fill the top of the list.
+//
+// `place` is what the list covers: the visible map ('view', the default) or a
+// box dragged out on the map ('box'). A search (`q`) looks everywhere instead,
+// because what people search for is rarely on screen.
 const rankState = { type: 'trails', named: true, minLen: 1000, sort: 'V', dir: -1,
-  shown: RANK_PAGE };
+  shown: RANK_PAGE, place: 'view', box: null, q: '' };
+const rankMeta = { vmax: null };   // from the last response: the filter's scale
 let rankSel = null;                // { key, theme, layers: [], marker }
 let rankLastUpdate = null;          // the status file's last write we acted on
 
-function rankRows() {
-  const col = RANK_COLS.find((c) => c[0] === rankState.sort);
-  const get = col[3];
-  const rows = [];
-  for (const r of featureItems.values()) {
-    if (rankState.type !== 'all' && r.theme !== rankState.type) continue;
-    if (rankState.named && !r.name) continue;
-    if (r.kind === 'line' && r.length_m < rankState.minLen) continue;
-    rows.push(r);
-  }
-  rows.sort((a, b) => {
-    const x = get(a), y = get(b);
-    // missing values always sink, whichever way the column is sorted
-    const xm = x === null || x === undefined || x === '';
-    const ym = y === null || y === undefined || y === '';
-    if (xm || ym) return xm === ym ? 0 : (xm ? 1 : -1);
-    if (col[5]) return (x - y) * rankState.dir;
-    return String(x).localeCompare(String(y)) * rankState.dir;
-  });
-  return rows;
+/** The list's area: the drawn box, or what the map shows. */
+function rankBbox() {
+  if (rankState.place === 'box' && rankState.box) return rankState.box;
+  const b = map.getBounds();
+  return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
 }
 
+let rankSeq = 0;
+let rankTimer = null;
+const RANK_DEBOUNCE_MS = 80;       // coalesces typing, panning and slider drags
+
+/** Ask for the list again (debounced); drawRank shows the answer. */
 function renderRank() {
   const box = $('rank');
   if (!box || box.hidden) return;
-  const rows = rankRows();
+  clearTimeout(rankTimer);
+  rankTimer = setTimeout(fetchRank, RANK_DEBOUNCE_MS);
+}
+
+async function fetchRank() {
+  const seq = ++rankSeq;
+  const p = new URLSearchParams({
+    slug: AOI, type: rankState.type, named: rankState.named ? '1' : '0',
+    min_len: String(rankState.minLen), vmode: vfState.mode, vmin: String(vfState.min),
+    sort: rankState.sort, dir: String(rankState.dir), limit: String(rankState.shown),
+  });
+  if (rankState.q) p.set('q', rankState.q);
+  else p.set('bbox', rankBbox().map((v) => v.toFixed(5)).join(','));
+  if (rankSel) p.set('pin', rankSel.key);
+  let res;
+  try {
+    const r = await fetch(`/api/feature_query?${p}`);
+    if (!r.ok) return;
+    res = await r.json();
+  } catch (err) { return; }
+  if (seq !== rankSeq) return;     // a newer request has been sent since
+  rankMeta.vmax = res.vmax;
+  drawRank(res);
+}
+
+function drawRank(res) {
+  const rows = res.rows || [];
+  // A selection lasts only while the item passes the list's filters: a box
+  // redrawn without it, another type, a search that misses it, the map
+  // panned away in Visible area. Passing but below the page, it is shown at
+  // the top.
+  //
+  // Not in the first moments of a selection, though: opening the panorama
+  // takes the bottom of the window, which shrinks the map and with it the
+  // visible area, and an item low on the map would be dropped the instant it
+  // was picked. Only what the user changes afterwards can drop it.
+  if (rankSel && res.pinned_match === false
+      && performance.now() - rankSel.since > RANK_SEL_GRACE_MS) clearRankSelection();
+  const pinned = rankSel && res.pinned && res.pinned_match
+    && !rows.some((r) => r.id === res.pinned.id) ? res.pinned : null;
   const head = $('rank-table').tHead;
   head.replaceChildren();
   const hr = el('tr');
@@ -2824,12 +3054,13 @@ function renderRank() {
 
   const body = $('rank-table').tBodies[0];
   body.replaceChildren();
-  rows.slice(0, rankState.shown).forEach((r, i) => {
+  (pinned ? [pinned, ...rows] : rows).forEach((r, i) => {
     const tr = el('tr');
     tr.dataset.key = r.id;
     if (rankSel && rankSel.key === r.id) tr.classList.add('sel');
+    if (r === pinned) tr.classList.add('pinned');
     const n = el('td', 'num rank-n');
-    n.textContent = String(i + 1);
+    n.textContent = r === pinned ? '·' : String(pinned ? i : i + 1);
     tr.appendChild(n);
     for (const [key, , , get, fmt] of rankCols()) {
       const td = el('td', key === 'name' ? 'name' : 'num');
@@ -2846,18 +3077,145 @@ function renderRank() {
       }
       tr.appendChild(td);
     }
-    tr.addEventListener('click', () => selectRankItem(r));
+    // clicking the selected row only deselects it: the viewpoint and the
+    // map stay where they are
+    tr.addEventListener('click', () => {
+      if (rankSel && rankSel.key === r.id) { clearRankSelection(); renderRank(); return; }
+      selectRankItem(r);
+    });
     body.appendChild(tr);
   });
   const more = $('rank-more');
-  more.hidden = rows.length <= rankState.shown;
-  more.textContent = `Show ${Math.min(RANK_PAGE, rows.length - rankState.shown)} more`;
+  more.hidden = res.total <= rows.length;
+  more.textContent = `Show ${Math.min(RANK_PAGE, res.total - rows.length).toLocaleString()} more`;
   const kind = { all: 'items', water_areas: 'lakes' }[rankState.type] || rankState.type;
   const minLen = rankState.minLen && (rankState.type === 'trails' || rankState.type === 'all')
     ? `, trails ≥ ${rankState.minLen / 1000} km` : '';
-  $('rank-count').textContent = `${rows.length.toLocaleString()} ${kind}`
+  const where = rankState.q ? ` matching “${rankState.q}”`
+    : (rankState.place === 'box' && rankState.box ? ' in the box' : ' in view');
+  $('rank-count').textContent = `${res.total.toLocaleString()} ${kind}${where}`
     + (rankState.named ? ', named only' : '') + minLen;
+  if (vfState.min > 0) {
+    $('vf-count').textContent = `${res.vf_pass.toLocaleString()} of ${res.scored.toLocaleString()}`
+      + ` scored items pass (${vfState.mode === 'best' ? 'best' : 'average'} V)`;
+  }
 }
+
+// ---- the list's area: the visible map, or a box --------------------------
+//
+// In 'view' the list follows the map, debounced. In 'box' it holds still
+// while the map moves: the box is dragged out on the map (map dragging is off
+// meanwhile, and the drag must not also drop a viewpoint), stays drawn, and
+// is remembered in the browser.
+let rankBoxLayer = null;
+let rankBoxDrawing = false;
+const RANK_BOX_STYLE = { color: SELECT_COLOR, weight: 2, dashArray: '6 5', fill: true,
+  fillOpacity: 0.04, interactive: false };
+
+function showRankBox() {
+  if (rankBoxLayer) { map.removeLayer(rankBoxLayer); rankBoxLayer = null; }
+  if (rankState.place !== 'box' || !rankState.box) return;
+  const [w, s, e, n] = rankState.box;
+  rankBoxLayer = L.rectangle([[s, w], [n, e]], RANK_BOX_STYLE).addTo(map);
+}
+
+function saveRankPlace() {
+  try {
+    localStorage.setItem('rank-place', rankState.place);
+    localStorage.setItem('rank-box', JSON.stringify(rankState.box));
+  } catch (e) { /* no storage: not remembered */ }
+}
+
+function setRankPlace(place) {
+  rankState.place = place;
+  for (const x of $('rank-place').querySelectorAll('button')) {
+    x.classList.toggle('on', x.dataset.place === place);
+  }
+  $('rank-box-draw').hidden = place !== 'box';
+  $('rank-box-clear').hidden = place !== 'box';
+  showRankBox();
+  saveRankPlace();
+  rankState.shown = RANK_PAGE;
+  renderRank();
+  if (place === 'box' && !rankState.box) startRankBox();
+}
+
+function startRankBox() {
+  if (rankBoxDrawing) return;
+  rankBoxDrawing = true;
+  const c = map.getContainer();
+  c.classList.add('drawing-box');
+  map.dragging.disable();
+  let start = null, rect = null;
+  const finish = (bounds) => {
+    map.off('mousedown', down); map.off('mousemove', move); map.off('mouseup', up);
+    document.removeEventListener('keydown', esc);
+    if (rect) map.removeLayer(rect);
+    map.dragging.enable();
+    c.classList.remove('drawing-box');
+    // the click that ends the drag comes after mouseup: stay "drawing" for it
+    setTimeout(() => { rankBoxDrawing = false; }, 0);
+    if (bounds) {
+      rankState.box = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+    } else if (!rankState.box) {
+      setRankPlace('view');          // nothing drawn and nothing to keep
+      return;
+    }
+    showRankBox();
+    saveRankPlace();
+    rankState.shown = RANK_PAGE;
+    renderRank();
+  };
+  const down = (e) => {
+    start = e.latlng;
+    rect = L.rectangle(L.latLngBounds(start, start), { ...RANK_BOX_STYLE, dashArray: null }).addTo(map);
+  };
+  const move = (e) => { if (start) rect.setBounds(L.latLngBounds(start, e.latlng)); };
+  const up = (e) => {
+    if (!start) return;
+    const a = map.latLngToContainerPoint(start), b = map.latLngToContainerPoint(e.latlng);
+    // a click, not a drag: keep waiting for one
+    if (Math.abs(a.x - b.x) < 8 || Math.abs(a.y - b.y) < 8) {
+      map.removeLayer(rect); rect = null; start = null;
+      return;
+    }
+    finish(L.latLngBounds(start, e.latlng));
+  };
+  const esc = (e) => { if (e.key === 'Escape') finish(null); };
+  map.on('mousedown', down); map.on('mousemove', move); map.on('mouseup', up);
+  document.addEventListener('keydown', esc);
+}
+
+$('rank-place').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-place]');
+  if (b && b.dataset.place !== rankState.place) setRankPlace(b.dataset.place);
+});
+$('rank-box-draw').addEventListener('click', () => startRankBox());
+$('rank-box-clear').addEventListener('click', () => { rankState.box = null; setRankPlace('view'); });
+$('rank-q').addEventListener('input', (e) => {
+  rankState.q = e.target.value.trim();
+  rankState.shown = RANK_PAGE;
+  renderRank();
+});
+map.on('moveend', () => {
+  if (rankState.place === 'view' && !rankState.q) {
+    rankState.shown = RANK_PAGE;
+    renderRank();
+  }
+});
+try {
+  const box = JSON.parse(localStorage.getItem('rank-box') || 'null');
+  if (Array.isArray(box) && box.length === 4) rankState.box = box;
+  if (localStorage.getItem('rank-place') === 'box' && rankState.box) {
+    rankState.place = 'box';
+    for (const x of $('rank-place').querySelectorAll('button')) {
+      x.classList.toggle('on', x.dataset.place === 'box');
+    }
+    $('rank-box-draw').hidden = false;
+    $('rank-box-clear').hidden = false;
+    showRankBox();
+  }
+} catch (e) { /* no storage: the visible area */ }
 
 /** Restore the map styling of whatever is currently selected. */
 function clearRankSelection() {
@@ -2886,23 +3244,83 @@ function markRankLayer(lyr) {
   lyr.setStyle(RANK_SEL_STYLE(styleFor(rankSel.theme, f.properties).weight));
 }
 
+// Selecting a row also opens the panorama at the item's best point, facing
+// its best direction. The direction needs the point's V by azimuth, which
+// only arrives with its score, so the request waits in panoAim until the
+// score for that point lands (renderViewScore), and is dropped if another
+// viewpoint is opened first.
+let panoAim = null;                // { lat, lon, heading? } to aim the camera from
+const AIM_TOL_DEG = 1e-5;          // ~1 m: "the same point"
+const AIM_PITCH_MIN = -10, AIM_PITCH_MAX = 20;
+
+/** Where an item is best seen from: a trail's or lake's best point, or the
+ *  peak or pass itself (already the scored summit). */
+function bestPointOf(r) {
+  if (isPathRecord(r) && r.best) return [r.best.lat, r.best.lon];
+  if (r.lat !== undefined) return [r.lat, r.lon];
+  return null;
+}
+
+/** The heading that puts the most V inside the camera's horizontal field of
+ *  view, from a score's 1-degree V-by-azimuth bins, and a pitch half way up
+ *  to the skyline there, so a wall over a lake is framed and a summit's
+ *  panorama sits on the horizon. */
+function bestHeading(d, hfov) {
+  const v = d.by_azimuth.v, hz = d.by_azimuth.horizon_deg;
+  const n = v.length;
+  const w = Math.max(1, Math.min(n, Math.round(hfov)));
+  let sum = 0;
+  for (let i = 0; i < w; i++) sum += v[i];
+  let best = sum, start = 0;
+  for (let i = 1; i < n; i++) {           // slide the window round the circle
+    sum += v[(i + w - 1) % n] - v[i - 1];
+    if (sum > best) { best = sum; start = i; }
+  }
+  const yaw = (start + w / 2) % 360;      // bin i covers [i, i + 1) degrees
+  const sky = hz[Math.floor(yaw) % n];
+  return { yaw, pitch: Math.max(AIM_PITCH_MIN, Math.min(AIM_PITCH_MAX, 0.5 * sky)) };
+}
+
 function selectRankItem(r) {
   clearRankSelection();
-  rankSel = { key: r.id, theme: r.theme, layers: [], marker: null };
+  rankSel = { key: r.id, theme: r.theme, layers: [], marker: null, since: performance.now() };
+  // open the panorama first: it takes the bottom of the window, and the map
+  // fit below has to be computed for the map that is left
+  const at = bestPointOf(r);
+  if (at) {
+    // The heading to face was found when the item was scored (r.view), so
+    // the camera and the map's view wedge take it at once, before the
+    // panorama loads; showing the previous heading until then read as a
+    // jump. Older records without it fall back to aiming once this point's
+    // score arrives.
+    panoAim = r.view ? null : { lat: at[0], lon: at[1] };
+    // no snap: the panorama stands exactly where the score was taken
+    renderPanorama(L.latLng(at[0], at[1]), { snap: 0, aim: true, view: r.view });
+    syncLayoutVars();
+    if (r.view) {
+      drawPanoFov(at[0], at[1], r.view.yaw, panoHfovDeg(pano),
+        sliderToRange(+$('pano-range').value));
+    }
+  }
   // make sure the item's layer is on, or there is nothing to look at
   const st = vectorLayers[r.theme];
   if (st && !st.enabled && st.cb) { st.cb.checked = true; st.cb.dispatchEvent(new Event('change')); }
-  // The map runs underneath the left panel, so centre on the part of it that
-  // is actually visible: pad the fit by the panel's width on that side.
+  // The map moves only when that cannot change what the list shows. In
+  // Visible area it stays put (the item is already in view, and moving
+  // would refilter the list); in a box, or with a search (which looks
+  // everywhere), it fits the item, but no closer than RANK_FIT_MAX_ZOOM
+  // unless a long trail needs it further out. The map runs underneath the
+  // left panel, so the fit is padded by the panel's width on that side.
+  const move = rankState.place === 'box' || !!rankState.q;
   const panelW = $('panel').classList.contains('hidden') ? 0 : $('panel').getBoundingClientRect().width;
-  const fit = { paddingTopLeft: [panelW + 50, 50], paddingBottomRight: [50, 50] };
+  const fit = { paddingTopLeft: [panelW + 50, 50], paddingBottomRight: [50, 50],
+    maxZoom: RANK_FIT_MAX_ZOOM };
   if (isPathRecord(r) && r.bbox) {
     const [w, s, e, n] = r.bbox;
-    map.fitBounds([[s, w], [n, e]], { ...fit, maxZoom: 15 });
+    if (move) map.fitBounds([[s, w], [n, e]], fit);
     if (st) st.onMap.forEach((gj) => gj.eachLayer(markRankLayer));
   } else if (r.lat !== undefined) {
-    const z = Math.max(map.getZoom(), 14);
-    map.fitBounds(L.latLng(r.lat, r.lon).toBounds(1), { ...fit, maxZoom: z });
+    if (move) map.fitBounds(L.latLng(r.lat, r.lon).toBounds(1), fit);
     rankSel.marker = L.circleMarker([r.lat, r.lon], {
       renderer: panoOverlayRenderer, interactive: false, radius: 12,
       color: SELECT_COLOR, weight: 3, fill: false,
@@ -2933,7 +3351,7 @@ async function pollScoreAll() {
   // reload only when the job has written something new since last time
   if (st.updated !== rankLastUpdate || rankLastUpdate === null) {
     rankLastUpdate = st.updated;
-    await loadFeatureScores();
+    await loadFeatureScores();               // re-applies the V filter too
     renderRank();
   }
   setTimeout(pollScoreAll, running ? RANK_POLL_MS : RANK_IDLE_POLL_MS);

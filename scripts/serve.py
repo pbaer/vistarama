@@ -2,8 +2,9 @@
 
     python scripts/serve.py [port]
 
-Serves the repository root so /viewer/ and /data/web/ are both reachable, and
-redirects / to the viewer.
+Serves the repository root so /viewer/ is reachable, maps /data/ onto the
+data root (`aoi.DATA`, which may live outside the repo), and redirects / to
+the viewer.
 
 Two things beyond plain static serving:
 
@@ -20,6 +21,8 @@ Two things beyond plain static serving:
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
 import sys
 import threading
 from functools import partial
@@ -27,24 +30,50 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from aoi import DATA
+
 ROOT = Path(__file__).resolve().parent.parent
+
+# /data/web/<slug>/layers/<layer>/<z>/<x>/<y>.<ext>, served from
+# layers/<layer>.mbtiles when that file exists (see tiles.py)
+_TILE_URL = re.compile(r"^/data/web/([^/]+)/layers/([^/]+)/(\d+)/(\d+)/(\d+)\.(png|jpg)$")
+_mbt_local = threading.local()
+
+
+def _mbtiles_tile(path: Path, z: int, x: int, y: int) -> bytes | None:
+    """One tile from an MBTiles file, or None. A read-only connection per
+    thread and file, reopened if the file has been rebuilt since."""
+    conns = getattr(_mbt_local, "conns", None)
+    if conns is None:
+        conns = _mbt_local.conns = {}
+    mtime = path.stat().st_mtime
+    hit = conns.get(path)
+    if hit is None or hit[1] != mtime:
+        if hit is not None:
+            hit[0].close()
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True,
+                               check_same_thread=False)
+        conns[path] = hit = (conn, mtime)
+    row = hit[0].execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? "
+                         "AND tile_row=?", (z, x, (1 << z) - 1 - y)).fetchone()
+    return row[0] if row else None
 DEFAULT_PORT = 8765
 TILE_MAX_AGE = 86400
 
 _lock = threading.Lock()
 _transformers: dict[str, object] = {}
 
-# id -> (path relative to repo root, unit, decimals)
+# id -> (path relative to the data root, unit, decimals)
 SAMPLE_LAYERS = {
-    "dem": ("data/interim/{slug}/dem_5070.tif", "m", 0),
-    "slope": ("data/derived/{slug}/slope.tif", "°", 1),
+    "dem": ("interim/{slug}/dem_5070.tif", "m", 0),
+    "slope": ("derived/{slug}/slope.tif", "°", 1),
     # ruggedness is an angle (RMS slope-vector deviation), relief is a length
-    "ruggedness": ("data/derived/{slug}/ruggedness.tif", "°", 1),
-    "relief_sigma": ("data/derived/{slug}/relief_sigma.tif", "m", 0),
-    "hillshade": ("data/derived/{slug}/hillshade.tif", "/255", 0),
-    "canopy_density": ("data/derived/{slug}/canopy_density.tif", "%", 0),
-    "builtup_density": ("data/derived/{slug}/builtup_density.tif", "%", 0),
-    "landcover": ("data/interim/{slug}/landcover_5070.tif", "", 0),
+    "ruggedness": ("derived/{slug}/ruggedness.tif", "°", 1),
+    "relief_sigma": ("derived/{slug}/relief_sigma.tif", "m", 0),
+    "hillshade": ("derived/{slug}/hillshade.tif", "/255", 0),
+    "canopy_density": ("derived/{slug}/canopy_density.tif", "%", 0),
+    "builtup_density": ("derived/{slug}/builtup_density.tif", "%", 0),
+    "landcover": ("interim/{slug}/landcover_5070.tif", "", 0),
 }
 
 WORLDCOVER_LABELS = {
@@ -78,7 +107,7 @@ def sample_point(slug: str, lon: float, lat: float) -> dict:
     out: dict[str, object] = {}
     with _lock:
         for key, (tmpl, unit, nd) in SAMPLE_LAYERS.items():
-            path = ROOT / tmpl.format(slug=slug)
+            path = DATA / tmpl.format(slug=slug)
             if not path.exists():
                 continue
             try:
@@ -122,6 +151,21 @@ class Handler(SimpleHTTPRequestHandler):
     }
 
     def do_GET(self):  # noqa: N802
+        m = _TILE_URL.match(urlparse(self.path).path)
+        if m:
+            mbt = DATA / "web" / m.group(1) / "layers" / f"{m.group(2)}.mbtiles"
+            if mbt.exists():
+                data = _mbtiles_tile(mbt, int(m.group(3)), int(m.group(4)), int(m.group(5)))
+                if data is None:
+                    self.send_error(404, "no tile")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "image/jpeg" if m.group(6) == "jpg" else "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
         parsed = urlparse(self.path)
         if parsed.path == "/api/point":
             return self._api_point(parse_qs(parsed.query))
@@ -139,11 +183,27 @@ class Handler(SimpleHTTPRequestHandler):
             import featurescore
             slug = parse_qs(parsed.query).get("slug", ["alpine-lakes"])[0]
             return self._json(featurescore.summaries(slug))
+        if parsed.path == "/api/feature_query":
+            # one page of the ranked list (see scoreindex.query)
+            import scoreindex
+            q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            try:
+                return self._json(scoreindex.query(
+                    q.get("slug", "alpine-lakes"),
+                    bbox=scoreindex.parse_bbox(q.get("bbox")), q=q.get("q", ""),
+                    type_=q.get("type", "trails"), named=q.get("named", "1") == "1",
+                    min_len=float(q.get("min_len", 0)), vmode=q.get("vmode", "avg"),
+                    vmin=float(q.get("vmin", 0)), sort=q.get("sort", "V"),
+                    direction=int(q.get("dir", -1)), offset=int(q.get("offset", 0)),
+                    limit=min(5000, int(q.get("limit", 200))), pin=q.get("pin") or None))
+            except FileNotFoundError:
+                return self._json({"total": 0, "rows": [], "scored": 0, "vf_pass": 0,
+                                   "vmax": {"avg": 0, "best": 0}})
         if parsed.path == "/api/score_all_status":
             # progress of scripts/score_all.py, which rewrites this file
             # after every chunk; absent if it has never run
             slug = parse_qs(parsed.query).get("slug", ["alpine-lakes"])[0]
-            sp = ROOT / "data" / "derived" / slug / "score_all.json"
+            sp = DATA / "derived" / slug / "score_all.json"
             if not sp.exists():
                 return self._json({"state": "none"})
             return self._json(json.loads(sp.read_text(encoding="utf-8")))
@@ -196,7 +256,7 @@ class Handler(SimpleHTTPRequestHandler):
             fov = float(q.get("fov", ["60"])[0])
             el_center = float(q.get("el", ["-2"])[0])
             rng = float(q.get("range_km", ["60"])[0])
-            base = ROOT / "data"
+            base = DATA
             payload = json.dumps(panorama.render(
                 dem_path=base / "interim" / slug / "dem_5070.tif",
                 hillshade_path=base / "derived" / slug / "hillshade.tif",
@@ -237,7 +297,7 @@ class Handler(SimpleHTTPRequestHandler):
             # derived from the target spacing in terrain_mesh
             n_r = int(q.get("n_r", ["300"])[0])
             snap_m = float(q.get("snap_m", ["150"])[0])
-            base = ROOT / "data"
+            base = DATA
             header, payload = panorama.terrain_mesh(
                 dem_path=base / "interim" / slug / "dem_5070.tif",
                 hillshade_path=base / "derived" / slug / "hillshade.tif",
@@ -280,7 +340,7 @@ class Handler(SimpleHTTPRequestHandler):
             lon = float(q.get("lon", ["nan"])[0])
             slug = q.get("slug", ["alpine-lakes"])[0]
             snap_m = float(q.get("snap_m", ["150"])[0])
-            dem_path = ROOT / "data" / "interim" / slug / "dem_5070.tif"
+            dem_path = DATA / "interim" / slug / "dem_5070.tif"
             dem, crs, transform, _bounds, nodata = panorama._read_full(dem_path)
             snap = (panorama.snap_to_local_max(dem, transform, crs, lat, lon,
                                                nodata, snap_m)
@@ -318,6 +378,16 @@ class Handler(SimpleHTTPRequestHandler):
         job id to poll at /api/feature_score_job.
         """
         parsed = urlparse(self.path)
+        if parsed.path == "/api/feature_lookup":
+            # the scores behind the features a map tile holds (scoreindex.lookup)
+            import scoreindex
+            n = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(n) or b"{}")
+            try:
+                return self._json(scoreindex.lookup(req.get("slug", "alpine-lakes"),
+                                                    list(req.get("ids", []))[:20000]))
+            except FileNotFoundError:
+                return self._json({})
         if parsed.path != "/api/feature_score":
             return self._json({"error": "not found"}, 404)
         try:
@@ -347,7 +417,7 @@ class Handler(SimpleHTTPRequestHandler):
             # optional: the score at another eye height, for the viewer's
             # "at the slider height" comparison. Omitted means the standard 2 m.
             eye = q.get("eye_m")
-            base = ROOT / "data"
+            base = DATA
             kw = {}
             if eye:
                 kw["eye_m"] = min(5000.0, max(0.1, float(eye[0])))
@@ -385,11 +455,15 @@ class Handler(SimpleHTTPRequestHandler):
             # LOD ladder is centred on the observer, the focus patch is not
             cx = float(q.get("cx", ["0"])[0])
             cy = float(q.get("cy", ["0"])[0])
-            base = ROOT / "data"
+            base = DATA
             interim = base / "interim" / slug
-            # priority order: the sharpest source that covers each pixel wins
-            sources = [interim / "imagery_naip_5070.tif",
-                       interim / "imagery_s2_5070.tif"]
+            # priority order: the sharpest source that covers each pixel wins.
+            # A region's NAIP is a VRT over its work tiles, and its Sentinel-2
+            # has a coarse far-field file past the 10 m one.
+            naip = interim / "imagery_naip_5070.vrt"
+            sources = [naip if naip.exists() else interim / "imagery_naip_5070.tif",
+                       interim / "imagery_s2_5070.tif",
+                       interim / "imagery_s2far_5070.tif"]
             # Rendered inline, on the server's own thread.
             #
             # A ProcessPoolExecutor was tried here on the theory that the GIL
@@ -419,6 +493,17 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(msg)))
             self.end_headers()
             self.wfile.write(msg)
+
+    def translate_path(self, path):
+        # /data/... comes from the data root; /data/aoi/ stays in the repo
+        local = Path(super().translate_path(path))   # already sanitised
+        try:
+            rel = local.relative_to(ROOT / "data")
+        except ValueError:
+            return str(local)
+        if not rel.parts or rel.parts[0] == "aoi":
+            return str(local)
+        return str(DATA / rel)
 
     def end_headers(self):
         path = urlparse(self.path).path

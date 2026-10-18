@@ -47,7 +47,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+from aoi import AOI_DIR, DATA
+
 
 TRAIL_SPACING_M = 50.0
 PEAK_SNAP_M = 150.0
@@ -61,7 +62,32 @@ REFINE_FINE_M = 4.0
 POOL_WORKERS = 8
 # Themes that can be scored, and how their geometry becomes sample points.
 SCORABLE = {"trails": "line", "peaks": "summit", "passes": "point",
-            "water_areas": "shore"}
+            "water_areas": "shore", "camps": "point"}
+
+# Themes that are a filtered view of another raw OSM file: the POI download
+# holds huts, camps, shelters, viewpoints and water sources together, and the
+# map and the scores split it (poi_kind).
+RAW_THEME = {"camps": "poi", "viewpoints": "poi"}
+
+# Shelters that are not somewhere to stay: bus stops, picnic shelters, gazebos.
+NOT_CAMP_SHELTERS = {"public_transport", "picnic_shelter", "gazebo", "field_shelter",
+                     "parking", "pavilion"}
+
+
+def poi_kind(props: dict) -> str | None:
+    """What a POI is: 'camp' (campsite, hut or trail shelter: scored),
+    'water' (spring or drinking water: shown with the camps, not scored),
+    'viewpoint', or None (nothing this project shows)."""
+    t, a = props.get("tourism"), props.get("amenity")
+    if t == "viewpoint":
+        return "viewpoint"
+    if t in ("camp_site", "camp_pitch", "alpine_hut", "wilderness_hut"):
+        return "camp"
+    if a == "shelter":
+        return None if props.get("shelter_type") in NOT_CAMP_SHELTERS else "camp"
+    if a == "drinking_water" or props.get("natural") == "spring":
+        return "water"
+    return None
 
 # Lakes are scored along their shoreline, like a trail along its path. Only
 # standing water of at least LAKE_MIN_AREA_M2: a pond is not a destination,
@@ -82,7 +108,7 @@ _jobs_lock = threading.Lock()
 
 
 def _paths(slug: str) -> tuple[Path, Path]:
-    base = ROOT / "data" / "interim" / slug
+    base = DATA / "interim" / slug
     return base / "dem_5070.tif", base / "landcover_5070.tif"
 
 
@@ -93,10 +119,11 @@ def version() -> str:
            "peak_snap": "climb",
            "refine": [REFINE_TOP, REFINE_SPAN_M, REFINE_STEP_M, REFINE_FINE_M],
            "lakes": [LAKE_MIN_AREA_M2, sorted(map(str, LAKE_WATER_TYPES))],
+           "camps": sorted(NOT_CAMP_SHELTERS),
            "ring_wrap": True,
            "trail_sample": "midpoints", "trail_group": "same-name-connected",
            # the record layout: bump when records gain fields the viewer needs
-           "record": 2, "elev_step_m": ELEV_STEP_M,
+           "record": 3, "elev_step_m": ELEV_STEP_M,
            "gain_threshold_m": GAIN_THRESHOLD_M}
     h = hashlib.sha1(json.dumps(own, sort_keys=True).encode()).hexdigest()
     return f"{vscore.version_tag()}-f{h[:6]}"
@@ -147,9 +174,11 @@ def _raw_feature(slug: str, theme: str, fid: str) -> dict | None:
     key = (slug, theme)
     idx = _raw_cache.get(key)
     if idx is None:
-        src = ROOT / "data" / "raw" / "osm" / f"{slug}_{theme}.geojson"
+        src = DATA / "raw" / "osm" / f"{slug}_{RAW_THEME.get(theme, theme)}.geojson"
         gj = json.loads(src.read_text(encoding="utf-8"))
         idx = {f.get("id"): f for f in gj.get("features", []) if f.get("id")}
+        if theme == "camps":
+            idx = {k: f for k, f in idx.items() if poi_kind(f.get("properties") or {}) == "camp"}
         _raw_cache[key] = idx
     return idx.get(fid)
 
@@ -558,7 +587,13 @@ def build_item(slug: str, theme: str, fid: str) -> dict:
                      "sample_pos": pos, "area_m2": area,
                      "bbox": [min(xs), min(ys), max(xs), max(ys)]})
     else:
-        lon, lat = feat["geometry"]["coordinates"][:2]
+        if feat["geometry"]["type"] == "Point":
+            lon, lat = feat["geometry"]["coordinates"][:2]
+        else:
+            # a campsite mapped as an area: a point guaranteed inside it
+            from shapely.geometry import shape
+            rp = shape(feat["geometry"]).representative_point()
+            lon, lat = rp.x, rp.y
         moved = 0.0
         if kind == "summit":
             lat, lon, moved = climb_to_summit(slug, lat, lon)
@@ -623,6 +658,9 @@ def finish_record(item: dict, vals: list[float], elapsed_s: float) -> dict:
                     "ele_dem_m": None if dem_ele is None else round(dem_ele, 1),
                     "ele_min_m": None if ele is None else round(ele, 1),
                     "ele_max_m": None if ele is None else round(ele, 1)})
+    if item.get("view"):
+        # the heading to face at the item's best point (score_items)
+        rec["view"] = item["view"]
     rec["computed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rec["elapsed_s"] = round(elapsed_s, 2)
     return rec
@@ -696,9 +734,29 @@ def refine_bests(slug: str, items: list[dict], vals_by_item: list[list[float]]) 
         it["refined"][wi] = {"lat": lat, "lon": lon, "V": v}
 
 
+def view_headings(slug: str, pts: list) -> list[dict | None]:
+    """The best heading at each point (vscore.best_heading): per-ray V and
+    skyline from the GPU march, or the CPU score's breakdown without one."""
+    import vscore
+    gs = _gpu_scorer(slug)
+    if gs is not None:
+        return [None if r is None else vscore.heading_from_rays(*r)
+                for r in gs.score_rays(pts)]
+    dem, lc = _paths(slug)
+    out = []
+    for la, lo in pts:
+        try:
+            b = vscore.view_score(dem, lc, la, lo)["by_azimuth"]
+            out.append(vscore.best_heading(b["v"], b["horizon_deg"]))
+        except ValueError:
+            out.append(None)
+    return out
+
+
 def score_items(slug: str, items: list[dict], progress=None) -> list[dict]:
     """Score built items and return their records: the samples in one batch,
-    then the best-point refinement for every line in two more."""
+    the best-point refinement for every line in two more, and the heading at
+    each item's best point in a last one."""
     t0 = time.time()
     pts = [p for it in items for p in it["points"]]
     vals = score_points(slug, pts, progress)
@@ -707,6 +765,20 @@ def score_items(slug: str, items: list[dict], progress=None) -> list[dict]:
         by_item.append(vals[k:k + len(it["points"])])
         k += len(it["points"])
     refine_bests(slug, items, by_item)
+    # where each item is best seen from, and which way to look
+    spots = []
+    for it, v in zip(items, by_item):
+        refined = [b for b in it.get("refined") or [] if b]
+        if refined:
+            b = max(refined, key=lambda b: b["V"])
+            spots.append((b["lat"], b["lon"]))
+        elif it["kind"] in ("line", "shore"):
+            i = max(range(len(v)), key=lambda i: v[i])
+            spots.append(it["points"][i])
+        else:
+            spots.append(it["points"][0])
+    for it, h in zip(items, view_headings(slug, spots)):
+        it["view"] = h
     per = (time.time() - t0) / max(1, len(pts))
     return [finish_record(it, v, per * len(v)) for it, v in zip(items, by_item)]
 
@@ -765,20 +837,24 @@ def add_way_stats(slug: str) -> dict:
 
 
 def plan(slug: str, core_only: bool = True) -> list[tuple[str, str]]:
-    """Every scorable item in the AOI as (theme, fid): peaks and passes inside
-    the core box, every lake touching it, and every trail with at least one
-    way inside it, once per trail rather than once per way."""
-    from shapely.geometry import box, shape
-    aoi = json.loads((ROOT / "data" / "aoi" / f"{slug}.json").read_text("utf-8"))
+    """Every scorable item in the AOI as (theme, fid): peaks, passes and camps
+    inside the core box, every lake touching it, and every trail with at least
+    one way inside it, once per trail rather than once per way."""
+    from shapely.geometry import Polygon, box, shape
+    from shapely.prepared import prep
+    aoi = json.loads((AOI_DIR / f"{slug}.json").read_text("utf-8"))
     c = aoi["core"]
-    core = box(c["west"], c["south"], c["east"], c["north"])
+    # a region's core is a polygon (western Washington stops at a line along
+    # the foot of the east slopes); an AOI's is its box
+    core = prep(Polygon(aoi["core_polygon"]) if aoi.get("core_polygon")
+                else box(c["west"], c["south"], c["east"], c["north"]))
     out: list[tuple[str, str]] = []
-    for theme in ("peaks", "passes"):
+    for theme in ("peaks", "passes", "camps"):
         _raw_feature(slug, theme, "")
         for fid, f in _raw_cache[(slug, theme)].items():
-            if f["geometry"]["type"] != "Point":
+            if theme != "camps" and f["geometry"]["type"] != "Point":
                 continue
-            if not core_only or core.contains(shape(f["geometry"])):
+            if not core_only or core.intersects(shape(f["geometry"])):
                 out.append((theme, fid))
     _raw_feature(slug, "water_areas", "")
     for fid, f in _raw_cache[(slug, "water_areas")].items():
@@ -807,7 +883,7 @@ def plan(slug: str, core_only: bool = True) -> list[tuple[str, str]]:
 # atomically.
 
 def _store_path(slug: str) -> Path:
-    return ROOT / "data" / "derived" / slug / "feature_scores.json"
+    return DATA / "derived" / slug / "feature_scores.json"
 
 
 def _load(slug: str) -> dict:

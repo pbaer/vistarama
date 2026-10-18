@@ -695,7 +695,9 @@ VECTOR_LOD = {
     "glaciers":    [("low", 0.001), ("high", 0.00005)],
     "peaks":       [("low", 0.0), ("mid", 0.0), ("high", 0.0)],
     "passes":      [("high", 0.0)],
-    "poi":         [("high", 0.0)],
+    # both from the POI download, split by featurescore.poi_kind
+    "camps":       [("high", 0.0)],
+    "viewpoints":  [("high", 0.0)],
     "protected":   [("low", 0.001), ("high", 0.0001)],
 }
 
@@ -804,12 +806,21 @@ def build_vector_lod(slug: str, out_dir: Path,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = {}
+    import featurescore
     for theme, tiers in VECTOR_LOD.items():
-        src = RAW / "osm" / f"{slug}_{theme}.geojson"
+        src = RAW / "osm" / f"{slug}_{featurescore.RAW_THEME.get(theme, theme)}.geojson"
         if not src.exists():
             continue
         gj = json.loads(src.read_text(encoding="utf-8"))
         feats = gj.get("features", [])
+        if theme == "camps":
+            # huts, campsites and trail shelters, with springs and drinking
+            # water alongside; bus and picnic shelters belong to neither
+            feats = [f for f in feats
+                     if featurescore.poi_kind(f.get("properties") or {}) in ("camp", "water")]
+        elif theme == "viewpoints":
+            feats = [f for f in feats
+                     if featurescore.poi_kind(f.get("properties") or {}) == "viewpoint"]
         if not feats:
             log(f"vectors {theme}: empty, skipping")
             continue
@@ -821,6 +832,11 @@ def build_vector_lod(slug: str, out_dir: Path,
         # scores. Lengths are geodesic, from the raw geometry, so the
         # simplified tiers report the same numbers as the full one.
         extra_info = {}
+        if theme == "camps":
+            # the ones featurescore scores (not the water sources)
+            for f in feats:
+                if f.get("id") and featurescore.poi_kind(f.get("properties") or {}) == "camp":
+                    extra_info[f["id"]] = {"camp": 1}
         if theme == "water_areas":
             # lakes big enough to score carry their area, so the viewer only
             # offers V on what featurescore will accept
@@ -953,16 +969,22 @@ def main() -> int:
         return 1
     log(f"{len(dem_tiles)} DEM tiles, {len(lc_tiles)} land cover tiles")
 
-    dem_ll = mosaic_crop(dem_tiles, bb, interim / "dem_4326.tif")
-    dem = warp_to_metric(dem_ll, interim / "dem_5070.tif", DEM_RES,
-                         Resampling.bilinear)
+    # A region's metric rasters come from scripts/region.py, which warps
+    # straight from a VRT; mosaicking here would hold the whole far field in
+    # memory first. So only build what is not there yet.
+    dem = interim / "dem_5070.tif"
+    if not dem.exists():
+        dem_ll = mosaic_crop(dem_tiles, bb, interim / "dem_4326.tif")
+        dem = warp_to_metric(dem_ll, dem, DEM_RES, Resampling.bilinear)
 
-    lc = None
-    if lc_tiles:
-        lc_ll = mosaic_crop(lc_tiles, bb, interim / "landcover_4326.tif",
-                            nodata=0)
-        lc = warp_to_metric(lc_ll, interim / "landcover_5070.tif", LC_RES,
-                            Resampling.nearest, nodata=0)
+    lc = interim / "landcover_5070.tif"
+    if not lc.exists():
+        lc = None
+        if lc_tiles:
+            lc_ll = mosaic_crop(lc_tiles, bb, interim / "landcover_4326.tif",
+                                nodata=0)
+            lc = warp_to_metric(lc_ll, interim / "landcover_5070.tif", LC_RES,
+                                Resampling.nearest, nodata=0)
 
     # Imagery is optional and acquired by a separate script (scripts/imagery.py)
     # because it is the only source here that needs a STAC search rather than a
@@ -974,27 +996,40 @@ def main() -> int:
         imagery_s2 = warp_to_metric(s2_raw, interim / "imagery_s2_5070.tif",
                                     S2_RES, Resampling.bilinear, nodata=0)
         add_overviews(imagery_s2)
-    imagery_naip = interim / "imagery_naip_5070.tif"
-    if imagery_naip.exists():
-        add_overviews(imagery_naip)
-    else:
-        imagery_naip = None
+    elif (interim / "imagery_s2_5070.tif").exists():
+        # a region's composite, written in the metric CRS with overviews
+        imagery_s2 = interim / "imagery_s2_5070.tif"
+    # a region's NAIP is a VRT over its work tiles (imagery.write_naip_vrt)
+    imagery_naip = interim / "imagery_naip_5070.vrt"
+    if not imagery_naip.exists():
+        imagery_naip = interim / "imagery_naip_5070.tif"
+        if imagery_naip.exists():
+            add_overviews(imagery_naip)
+        else:
+            imagery_naip = None
     if not imagery_s2 and not imagery_naip:
         log("no satellite imagery present — run scripts/imagery.py to add it")
 
     # ---- derived -------------------------------------------------------
+    # A region can leave out derived layers V does not use (aoi
+    # "skip_derived"): ruggedness, openness and the densities are map layers
+    # only, and over a region's far field they are hours of compute.
+    skip = set(aoi.get("skip_derived", []))
     layers: dict[str, Path] = {"dem": dem}
     layers.update(derive_terrain(dem, derived))
-    layers["ruggedness"] = derive_ruggedness(
-        dem, derived / "ruggedness.tif", derived / "relief_sigma.tif", lc,
-        derived / "ruggedness_near.tif")
-    for key in ("relief_sigma", "ruggedness_near"):
-        if (derived / f"{key}.tif").exists():
-            layers[key] = derived / f"{key}.tif"
-    layers.update(derive_openness(dem, derived))
+    if "ruggedness" not in skip:
+        layers["ruggedness"] = derive_ruggedness(
+            dem, derived / "ruggedness.tif", derived / "relief_sigma.tif", lc,
+            derived / "ruggedness_near.tif")
+        for key in ("relief_sigma", "ruggedness_near"):
+            if (derived / f"{key}.tif").exists():
+                layers[key] = derived / f"{key}.tif"
+    if "openness" not in skip:
+        layers.update(derive_openness(dem, derived))
     if lc is not None:
         layers["landcover"] = lc
-        layers.update(derive_densities(lc, derived))
+        if "densities" not in skip:
+            layers.update(derive_densities(lc, derived))
 
     # ---- web tiles -----------------------------------------------------
     manifest = {
@@ -1144,12 +1179,18 @@ def main() -> int:
             layer="imagery_naip",
             # starts at z11: below that the Sentinel-2 layer is already finer
             # than the screen and these tiles would only duplicate it
-            rgb=True, zmin=11, zmax=15, extent="core",
+            # to z17 (0.8 m/px at this latitude): the mosaic is NAIP's native
+            # 0.6 m, and z18 would only quadruple the tiles to interpolate
+            rgb=True, zmin=11, zmax=17, extent="core",
+            # a region's NAIP covers boxes inside the core; its tiles carry
+            # Sentinel-2 where NAIP stops, and none are written beyond it
+            under=imagery_s2 if aoi.get("naip_boxes") else None,
             resampling=Resampling.bilinear, units="",
             attribution="USDA National Agriculture Imagery Program",
             description=(
-                "USDA NAIP aerial photography, resampled to 2 m. Public "
-                "domain. Covers the core AOI only.")))
+                "USDA NAIP aerial photography at its native 0.6 m (mostly "
+                "2023, some 2019 and 2021). Public domain. Covers the core "
+                "AOI only.")))
 
     def make_colorize(spec):
         if spec.get("categorical"):
@@ -1177,8 +1218,11 @@ def main() -> int:
             path = layers.get(spec["layer"])
             if not path or not Path(path).exists():
                 continue
-            out_dir = web / "layers" / key
-            marker = out_dir / "_complete.json"
+            # a region keeps each layer in one MBTiles file (aoi "tile_store");
+            # serve.py answers the same {z}/{x}/{y} URLs from either
+            out_dir = web / "layers" / (f"{key}.mbtiles" if aoi.get("tile_store") == "mbtiles"
+                                        else key)
+            marker = tl.complete_path(out_dir)
             if marker.exists():
                 stats = json.loads(marker.read_text(encoding="utf-8"))
                 log(f"skip tiles {key} ({stats['tiles']} tiles cached)")
@@ -1189,7 +1233,7 @@ def main() -> int:
                     stats = tl.write_rgb_pyramid(
                         Path(path), out_dir, extent,
                         spec["zmin"], spec["zmax"],
-                        resampling=spec["resampling"])
+                        resampling=spec["resampling"], under=spec.get("under"))
                 else:
                     stats = tl.write_pyramid(
                         Path(path), out_dir, extent, make_colorize(spec),
